@@ -24,7 +24,8 @@ to change this. Disable all optional pages for an uninterrupted album cover.
 Enable `show_artist_images` for up to three full-screen artist photos after the
 cover. Configure the MA server URL and token, then set `artist_image_count` to
 one, two, or three. Available photos are cached; missing and duplicate photos
-are skipped. The rotation is cover, artist photos, track information, equalizer.
+are skipped. The rotation is cover, artist photos, track information, equalizer,
+then an available video.
 
 When music stops or pauses, the app displays "music paused" for one minute,
 then turns WLED off. Resuming music cancels the shutdown and restores the cover.
@@ -35,7 +36,7 @@ Use the `rotation` dropdown to rotate the entire display clockwise by 0, 45,
 Choose `output_protocol: http` (default) or `ddp` in the Configuration tab.
 DDP streams directly over UDP 4048, supports smoother scrolling, and resends
 static images automatically. Disable WLED's Force max brightness setting before
-using DDP. Both modes support every page, rotation, and pause-then-off behavior.
+using DDP. Both modes support the non-video pages, rotation, and pause-then-off behavior.
 No separate HACS integration is required.
 
 Enable `show_equalizer` to add a live 16-band spectrum page. Set
@@ -43,6 +44,16 @@ Enable `show_equalizer` to add a live 16-band spectrum page. Set
 11988, and group that zone with the speaker whose music should drive the bars.
 DDP supports up to 20 FPS; HTTP is slower. The app receives multicast analysis
 data and does not require a microphone or Audio Reactive firmware on the panel.
+
+Enable `show_video` with DDP to add a YouTube video matched to the playing artist
+and song. The app bundles yt-dlp, FFmpeg, and Node.js; WLED receives only decoded
+64x64 pixels, not a video URL. Configure `video_fps` (5-20, default 10),
+`video_fit` (`contain` or `cover`), and `video_offset` (seconds, -60 to 60).
+Unmatched, failed, or stale video is skipped. Timing follows HA's playback
+position but music-video edits can differ from the audio. This disabled-by-default
+feature uses unofficial extraction, sends artist/title queries to YouTube, and
+may need app updates when YouTube changes. Access rights and service terms apply;
+no login or restricted-content bypass is provided. See the Documentation tab.
 
 Set the controller's URL in the Configuration tab, then start the app. There is
 no separate web interface or Home Assistant automation to configure.

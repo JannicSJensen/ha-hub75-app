@@ -1,10 +1,13 @@
 import importlib.util
+import asyncio
 import io
 import re
+import shutil
+import subprocess
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp
 import yaml
@@ -56,6 +59,13 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(config["options"]["artist_image_count"], 3)
         self.assertEqual(config["schema"]["artist_image_count"], "int(1,3)")
         self.assertEqual(config["schema"]["music_assistant_token"], "password?")
+        self.assertFalse(config["options"]["show_video"])
+        self.assertEqual(config["options"]["video_fps"], 10)
+        self.assertEqual(config["schema"]["video_fps"], "int(5,20)")
+        self.assertEqual(config["options"]["video_fit"], "contain")
+        self.assertEqual(config["schema"]["video_fit"], "list(contain|cover)")
+        self.assertEqual(config["options"]["video_offset"], 0)
+        self.assertEqual(config["schema"]["video_offset"], "int(-60,60)")
         self.assertNotIn("image", config)
         self.assertRegex(config["version"], r"^\d+\.\d+\.\d+$")
         changelog = (root / "hub75" / "CHANGELOG.md").read_text()
@@ -67,6 +77,231 @@ class ManifestTests(unittest.TestCase):
         pattern = entity_schema[6:-1]
         self.assertIsNotNone(re.fullmatch(pattern, "media_player.sound_mad_01"))
         self.assertIsNone(re.fullmatch(pattern, "light.wall_01"))
+
+
+class VideoMatchingTests(unittest.TestCase):
+    def test_video_is_last_page_and_missing_video_is_skipped(self):
+        cover = Image.new("RGB", (64, 64), "red")
+        artist = Image.new("RGB", (64, 64), "green")
+        video = Image.new("RGB", (64, 64), "blue")
+        selected = player()
+        for seconds, expected in ((0, cover), (8, artist), (24, APP.render_equalizer([128] * 16)),
+                                  (32, video), (40, cover)):
+            frame = APP.render_frame(cover, selected, seconds, artist_images=(artist,),
+                                     equalizer=[128] * 16, video=video)
+            self.assertEqual(frame.tobytes(), expected.tobytes())
+        self.assertEqual(APP.render_frame(cover, selected, 8, show_track_info=False,
+                                         video=video).tobytes(), video.tobytes())
+        self.assertEqual(APP.render_frame(cover, selected, 8, show_track_info=False).tobytes(),
+                         cover.tobytes())
+
+    def test_artist_title_and_version_must_match(self):
+        official = {"id": "abcdefghijk", "title": "Coldplay - Paradise (Official Video)",
+                    "duration": 260}
+        other = {"id": "12345678901", "title": "Another artist - Paradise"}
+        cover = {"id": "12345678902", "title": "Coldplay - Paradise piano cover"}
+        live = {"id": "12345678903", "title": "Coldplay - Paradise live"}
+        long = {"id": "12345678904", "title": "Coldplay - Paradise", "duration": 3600}
+        self.assertEqual(APP.matching_videos([other, cover, live, long, official],
+                                             "Coldplay", "Paradise", 240), [official])
+        self.assertEqual(APP.matching_videos([live], "Coldplay", "Paradise Live"), [live])
+
+    def test_channel_identity_missing_metadata_and_invalid_ids(self):
+        entry = {"id": "abcdefghijk", "title": "Paradise", "channel": "Coldplay"}
+        self.assertEqual(APP.matching_videos([None, {}, entry], "Coldplay", "Paradise"), [entry])
+        self.assertEqual(APP.matching_videos([entry], "", "Paradise"), [])
+        self.assertEqual(APP.matching_videos([entry], "Coldplay", ""), [])
+        entry["is_live"] = True
+        self.assertEqual(APP.matching_videos([entry], "Coldplay", "Paradise"), [])
+
+
+class VideoPageTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.video = APP.VideoPage()
+        self.addAsyncCleanup(self.video.close)
+        self.selected = player()
+        self.selected["attributes"].update(media_title="Paradise", media_artist="Coldplay",
+                                            media_duration=240, media_position=20)
+        self.result = {"id": "abcdefghijk", "title": "Coldplay - Paradise (Official Video)",
+                       "duration": 260, "url": "https://example.googlevideo.com/videoplayback"}
+
+    async def test_lookup_cache_stores_id_and_refreshes_expiring_stream_url(self):
+        extractor = AsyncMock(side_effect=[{"entries": [self.result]}, self.result, self.result])
+        with patch.object(self.video, "extractor_json", extractor):
+            self.assertEqual(await self.video.lookup("Coldplay", "Paradise", 240), self.result)
+            self.assertEqual(await self.video.lookup("Coldplay", "Paradise", 240), self.result)
+        self.assertEqual(extractor.await_count, 3)
+        self.assertEqual(self.video.cache[("coldplay", "paradise")][1], "abcdefghijk")
+
+    async def test_unavailable_or_unsafe_stream_is_negative_cached(self):
+        unsafe = dict(self.result, url="https://internal.invalid/video")
+        extractor = AsyncMock(side_effect=[{"entries": [self.result]}, unsafe])
+        with patch.object(self.video, "extractor_json", extractor):
+            self.assertIsNone(await self.video.lookup("Coldplay", "Paradise", 240))
+            self.assertIsNone(await self.video.lookup("Coldplay", "Paradise", 240))
+        self.assertEqual(extractor.await_count, 2)
+
+    async def test_background_decode_track_change_pause_and_close(self):
+        entered = asyncio.Event()
+        gate = asyncio.Event()
+
+        async def decode(*arguments):
+            self.video.frame = Image.new("RGB", (64, 64), "blue")
+            self.video.frame_time = APP.time.monotonic()
+            entered.set()
+            await gate.wait()
+
+        with patch.object(self.video, "lookup", AsyncMock(return_value=self.result)), \
+                patch.object(self.video, "decode", decode):
+            await self.video.update(self.selected)
+            await asyncio.wait_for(entered.wait(), 1)
+            self.assertIsNotNone(self.video.current_frame())
+            old_task = self.video.task
+            self.selected["attributes"]["media_title"] = "Another song"
+            await self.video.update(self.selected)
+            self.assertTrue(old_task.cancelled())
+            self.assertIsNone(self.video.frame)
+            await self.video.update({})
+            self.assertIsNone(self.video.task)
+            self.assertIsNone(self.video.key)
+
+    async def test_failure_does_not_retry_every_poll_and_stale_frames_are_skipped(self):
+        lookup = AsyncMock(side_effect=RuntimeError("redacted"))
+        with patch.object(self.video, "lookup", lookup), self.assertLogs("hub75", level="WARNING"):
+            await self.video.update(self.selected)
+            await self.video.task
+            await self.video.update(self.selected)
+        self.assertEqual(lookup.await_count, 1)
+        self.video.frame = Image.new("RGB", (64, 64), "red")
+        self.video.frame_time = APP.time.monotonic() - 3
+        self.assertIsNone(self.video.current_frame())
+
+    async def test_position_extrapolation_and_invalid_options(self):
+        self.selected["attributes"]["media_position_updated_at"] = datetime.now(timezone.utc).isoformat()
+        with patch.object(self.video, "run", AsyncMock()):
+            await self.video.update(self.selected)
+            self.assertAlmostEqual(self.video.desired_position(), 20, delta=1)
+            self.selected["attributes"]["media_position"] = 100
+            await self.video.update(self.selected)
+            self.assertAlmostEqual(self.video.desired_position(), 100, delta=1)
+        for arguments in ((4, "contain", 0), (21, "contain", 0), (10, "invalid", 0), (10, "cover", 61)):
+            with self.assertRaises(ValueError):
+                APP.VideoPage(*arguments)
+        with self.assertRaisesRegex(ValueError, "output_protocol: ddp"):
+            APP.ArtworkBridge(None, {"display_url": "http://wled", "show_video": True}, "token")
+
+    async def test_extractor_uses_structured_output_and_an_isolated_environment(self):
+        import json
+
+        reader = asyncio.StreamReader()
+        reader.feed_data(json.dumps(self.result).encode())
+        reader.feed_eof()
+        process = Mock(returncode=0, stdout=reader, wait=AsyncMock(return_value=0))
+        spawn = AsyncMock(return_value=process)
+        with patch.object(APP.asyncio, "create_subprocess_exec", spawn), \
+                patch.dict(APP.os.environ, {"SUPERVISOR_TOKEN": "secret", "OTHER_SECRET": "private"}):
+            self.assertEqual(await self.video.extractor_json("https://www.youtube.com/watch?v=abcdefghijk"),
+                             self.result)
+        arguments, options = spawn.call_args
+        self.assertIn("--ignore-config", arguments)
+        self.assertIn("--dump-single-json", arguments)
+        self.assertIn("--js-runtimes", arguments)
+        self.assertEqual(set(options["env"]), {"PATH", "HOME", "LANG"})
+        self.assertIsNone(self.video.process)
+
+    async def test_extractor_rejects_oversized_metadata(self):
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"x" * (2 * 1024 * 1024 + 1))
+        reader.feed_eof()
+        process = Mock(returncode=0, stdout=reader)
+
+        async def start(*arguments):
+            self.video.process = process
+            return process
+
+        with patch.object(self.video, "start_process", start):
+            with self.assertRaisesRegex(ValueError, "2 MiB"):
+                await self.video.extractor_json("ytsearch5:example", flat=True)
+        self.assertIsNone(self.video.process)
+
+    async def test_unresponsive_process_is_killed_and_reaped(self):
+        process = Mock(returncode=None, wait=AsyncMock(side_effect=[TimeoutError(), 0]))
+        self.video.process = process
+        await self.video.stop_process()
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+        self.assertEqual(process.wait.await_count, 2)
+        self.assertIsNone(self.video.process)
+
+    async def test_cancellation_during_spawn_does_not_orphan_process(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        process = Mock(returncode=None, wait=AsyncMock(return_value=0))
+
+        async def spawn(*arguments, **options):
+            entered.set()
+            await release.wait()
+            return process
+
+        with patch.object(APP.asyncio, "create_subprocess_exec", spawn):
+            task = asyncio.create_task(self.video.start_process("ffmpeg"))
+            await entered.wait()
+            task.cancel()
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        process.terminate.assert_called_once()
+        self.assertIsNone(self.video.process)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is required for real decoding")
+    async def test_real_ffmpeg_decodes_moving_frames_with_both_fit_modes(self):
+        source = await asyncio.to_thread(subprocess.run, [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-threads", "1", "-filter_threads", "1",
+            "-f", "lavfi", "-i", "testsrc=size=32x16:rate=10", "-t", "4",
+            "-c:v", "mpeg4", "-threads", "1", "-pix_fmt", "yuv420p",
+            "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", "pipe:1",
+        ], check=True, capture_output=True, timeout=10)
+
+        async def media(request):
+            self.assertNotIn("Authorization", request.headers)
+            return web.Response(body=source.stdout, content_type="video/mp4")
+
+        server = web.Application()
+        server.router.add_get("/video", media)
+        runner = web.AppRunner(server)
+        await runner.setup()
+        self.addAsyncCleanup(runner.cleanup)
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        url = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}/video"
+        original = APP.Image.frombytes
+        for fit in ("contain", "cover"):
+            self.video.fit = fit
+            self.video.position_time = APP.time.monotonic()
+            frames, ready = [], asyncio.Event()
+
+            def decoded(*arguments, **options):
+                frame = original(*arguments, **options)
+                frames.append(frame)
+                if len(frames) >= 2:
+                    ready.set()
+                return frame
+
+            with patch.object(APP.Image, "frombytes", side_effect=decoded):
+                self.video.task = asyncio.create_task(self.video.decode(url, {
+                    "Authorization": "never-forward", "Cookie": "never-forward",
+                    7: "invalid-header-name",
+                    "User-Agent": "HUB75-test", "Referer": "bad\r\nInjected: value",
+                }))
+                await asyncio.wait_for(ready.wait(), timeout=5)
+                self.assertEqual(frames[0].size, (64, 64))
+                self.assertNotEqual(frames[0].tobytes(), frames[1].tobytes())
+                self.assertIsNotNone(frames[0].getbbox())
+                if fit == "contain":
+                    self.assertIsNone(frames[0].crop((0, 0, 64, 10)).getbbox())
+                else:
+                    self.assertIsNotNone(frames[0].crop((0, 0, 64, 10)).getbbox())
+                await self.video.close()
+                self.assertIsNone(self.video.process)
 
 
 class SelectionTests(unittest.TestCase):
@@ -607,6 +842,98 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             asyncio.get_running_loop().sock_recv(self.receiver, 1500), timeout=1
         ) for _ in range(9)]
         return b"".join(packet[10:] for packet in packets)
+
+    async def test_video_ddp_page_rotation_stale_fallback_and_pause(self):
+        self.enable_ddp()
+        self.bridge.video = APP.VideoPage()
+        self.bridge.options.update(rotation="90", pause_then_off=True)
+        with patch.object(self.bridge.video, "run", AsyncMock()):
+            self.states[0]["attributes"].update(media_title="Song", media_artist="Artist")
+            await self.bridge.update()
+            await self.receive_ddp()
+            frame = Image.new("RGB", (64, 64), "blue")
+            frame.putpixel((0, 0), (255, 0, 0))
+            self.bridge.video.frame = frame
+            self.bridge.video.frame_time = APP.time.monotonic()
+            await self.bridge.update(poll=False)
+            await self.receive_ddp()
+            self.bridge.scroll_started -= 8
+            await self.bridge.update(poll=False)
+            self.assertEqual(await self.receive_ddp(), APP.rotate_frame(frame, "90").tobytes())
+            self.assertEqual(self.bridge.render_interval(), 0.1)
+            self.bridge.video.frame_time -= 3
+            await self.bridge.update(poll=False)
+            self.assertEqual(await self.receive_ddp(), APP.rotate_frame(APP.load_cover(self.art), "90").tobytes())
+            self.states = []
+            await self.bridge.update()
+            self.assertEqual(await self.receive_ddp(), APP.rotate_frame(APP.render_paused_frame(), "90").tobytes())
+            self.assertIsNone(self.bridge.video.task)
+
+    async def test_video_continues_rendering_during_slow_ha_poll(self):
+        self.enable_ddp()
+        self.bridge.video = APP.VideoPage()
+        self.states[0]["attributes"].update(media_title="Song", media_artist="Artist")
+        with patch.object(self.bridge.video, "run", AsyncMock()):
+            await self.bridge.update()
+            await self.receive_ddp()
+        self.bridge.video.frame = Image.new("RGB", (64, 64), "blue")
+        self.bridge.video.frame_time = APP.time.monotonic()
+        await self.bridge.update(poll=False)
+        await self.receive_ddp()
+        self.bridge.scroll_started -= 8
+        entered, release, uploaded = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        original = self.bridge.display_frame
+
+        async def slow_poll(*arguments):
+            entered.set()
+            await release.wait()
+            return self.states
+
+        async def display(frame, full_update):
+            await original(frame, full_update)
+            uploaded.set()
+
+        with patch.object(self.bridge, "get_json", slow_poll), \
+                patch.object(self.bridge, "display_frame", display):
+            task = asyncio.create_task(self.bridge.run_updates())
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                await asyncio.wait_for(uploaded.wait(), 1)
+                self.assertFalse(self.bridge.ha_poll_task.done())
+                self.assertEqual(await self.receive_ddp(), self.bridge.video.frame.tobytes())
+                self.bridge.stopping.set()
+                await asyncio.wait_for(task, 1)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                await self.bridge.close()
+                release.set()
+
+    async def test_video_pause_deadline_waits_for_fresh_poll_and_cleanup_handles_failure(self):
+        self.enable_ddp()
+        self.bridge.video = APP.VideoPage()
+        self.bridge.options["pause_then_off"] = True
+        await self.bridge.update()
+        await self.receive_ddp()
+        self.states = []
+        await self.bridge.update()
+        await self.receive_ddp()
+        self.bridge.pause_until -= 61
+        self.bridge.ha_poll_task = asyncio.create_task(asyncio.Event().wait())
+        await self.bridge.update(poll=False)
+        self.assertTrue(self.bridge.owns_display)
+        self.bridge.ha_poll_task.cancel()
+        await asyncio.gather(self.bridge.ha_poll_task, return_exceptions=True)
+        self.bridge.ha_poll_task = None
+        await self.bridge.update(poll=False)
+        self.assertTrue(self.bridge.owns_display)
+        await self.bridge.update()
+        self.assertFalse(self.bridge.owns_display)
+        self.bridge.ha_poll_task = asyncio.create_task(AsyncMock(side_effect=RuntimeError("poll failed"))())
+        await asyncio.gather(self.bridge.ha_poll_task, return_exceptions=True)
+        await self.bridge.close()
+        self.assertIsNone(self.bridge.ha_poll_task)
+        self.assertIsNone(self.bridge.ddp_socket)
 
     async def test_ddp_upload_keepalive_and_no_http_pixels(self):
         self.enable_ddp()

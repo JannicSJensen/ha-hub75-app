@@ -26,6 +26,10 @@ music_assistant_token: ""
 show_equalizer: false
 audio_sync_port: 11988
 audio_sync_interface: 0.0.0.0
+show_video: false
+video_fps: 10
+video_fit: contain
+video_offset: 0
 page_interval: 8
 rotation: "0"
 refresh_interval: 5
@@ -47,6 +51,10 @@ log_level: info
 | `show_equalizer` | Include a live 16-band spectrum page using Music Assistant's WLED Audio Sync data. Default: `false`. |
 | `audio_sync_port` | UDP zone port matching the Music Assistant WLED Audio Sync provider. Default: `11988`. Not DDP's port 4048. |
 | `audio_sync_interface` | HA host's local IPv4 address for joining the multicast group. `0.0.0.0` (default) selects the OS default interface. |
+| `show_video` | Add an unofficial YouTube video page. Default: `false`. Requires `output_protocol: ddp`. No API key or MA token needed. |
+| `video_fps` | Decoded video frames per second, from 5 to 20. Default: `10`. Lower this on slower HA hosts. |
+| `video_fit` | `contain` (default) preserves the full picture with black padding; `cover` fills the panel and crops the edges. |
+| `video_offset` | Video timing offset in seconds, -60 to 60. Default: `0`. Positive advances video; negative delays it, clamped at the beginning. |
 | `page_interval` | Seconds each available page remains visible, from 3 to 60. Default: 8. Only the cover is shown when no optional pages are available. |
 | `rotation` | Dropdown for clockwise rotation: `0`, `45`, `90`, `135`, or `180` degrees. Default: `0`. Applies to every page. |
 | `refresh_interval` | Seconds between HA checks, from 1 to 60. Default: 5. |
@@ -99,7 +107,7 @@ old `idle_action` behavior.
 ## Artist Photos
 
 Enable `show_artist_images` to rotate through **album cover > artist photo 1 >
-artist photo 2 > artist photo 3 > track information > equalizer > album cover**.
+artist photo 2 > artist photo 3 > track information > equalizer > video > album cover**.
 Only enabled and available pages are included. Set `artist_image_count: 2` for
 at most two photo pages, or `3` for at most three. If only one distinct photo is
 available, it appears once. Each page uses `page_interval` and the configured
@@ -157,7 +165,8 @@ these pages by default. With `pause_then_off: false` and `idle_action: keep`, th
 last rendered frame stays visible, including its last countdown value.
 
 Updating from 0.2.0 replaces the compact layout with these two pages. Set
-`show_artist_images: false`, `show_track_info: false`, and `show_equalizer: false`, then restart the app
+`show_artist_images: false`, `show_track_info: false`, `show_equalizer: false`, and
+`show_video: false`, then restart the app
 for an uninterrupted 64x64 cover.
 The HA polling
 interval still defaults to five seconds; the text/countdown render loop runs
@@ -215,6 +224,93 @@ identifier or playback timestamp, so the app cannot automatically select the
 correct room's audio or guarantee sample-perfect synchronization. Use matching
 zones and tune the Music Assistant provider's latency setting against the real
 speaker output. No audio stream is captured by this app.
+
+## YouTube Video Page
+
+1. Update the app to **0.9.0** or newer and configure WLED for DDP below.
+2. Set `output_protocol: ddp` and `show_video: true`. Video is not supported by
+  the HTTP pixel uploader; enabling video with HTTP prevents startup with a
+  configuration error.
+3. Start with `video_fps: 10`, `video_fit: contain`, and `video_offset: 0`.
+  Save and restart the app. HA Core does not need a restart.
+
+```yaml
+output_protocol: ddp
+show_video: true
+video_fps: 10
+video_fit: contain
+video_offset: 0
+```
+
+Available pages rotate through **cover > artist photos > track information >
+equalizer > video > cover**, omitting disabled or missing pages. `page_interval`
+applies to video too. Decoding continues while other pages are visible, so the
+video resumes at the current song position rather than restarting on each flip.
+When video becomes available or disappears, the cycle restarts at the cover.
+Shared clockwise rotation applies to every decoded frame.
+
+The app uses HA's artist/title to search up to five YouTube results and tries up
+to three conservative matches. Title words and artist identity must match;
+obvious covers, live versions, remixes, and similar alternate versions are
+rejected unless requested by the song metadata. When durations are known, a
+difference above 30 seconds or 15% of the audio duration, whichever is larger,
+is rejected. This is heuristic matching, not a guarantee of the correct video.
+Ambiguous collaborations, unusual titles, and songs without artist/title may
+have no video. There is no manual URL override.
+
+FFmpeg runs inside the app on the HA host. It reads a low-resolution direct
+HTTPS video stream, emits RGB24 frames, and never plays YouTube audio. WLED
+receives only pixels through UDP 4048; it does not decode MP4. Only direct HTTPS
+video formats at or below 360p are selected, so some otherwise playable YouTube
+videos are unavailable. No complete video is saved to disk. A 16:9 picture is
+normally about 64x36 with black padding in `contain` mode; `cover` fills 64x64
+by cropping. At 20 FPS, RGB payload alone is about 2 Mbit/s, plus packet overhead.
+Video decoding consumes CPU even while the video page is not visible. Lower
+`video_fps` if animation stutters or the HA host is overloaded.
+
+Timing extrapolates HA's `media_position` and `media_position_updated_at`.
+Seeks are picked up on the next HA poll and trigger decoder reseeking when the
+timing differs by more than two seconds. `video_offset: 5` advances the video
+five seconds; `-5` delays it. Stream buffering, unknown playback positions,
+speaker latency, and music-video intros/edits prevent frame-perfect sync. The
+app does not control, pause, or delay Music Assistant audio.
+
+Search and decoding run in background tasks, with asynchronous HA polling in
+video mode. Other pages continue during lookup and slow HA requests. Frames
+older than two seconds are excluded from the cycle. Lookup is bounded to 90
+seconds overall, and a stalled frame read times out after 15 seconds. Failures
+back off for five minutes. Up to 32 matching IDs are cached for 24 hours;
+unmatched lookups are cached for five minutes. Signed stream URLs are resolved
+again when a worker starts, not stored for long-term reuse. Restart clears the
+cache. Normal end-of-video skips that page for the rest of the track.
+
+Player/track changes, pause, idle, and app shutdown cancel the worker and stop
+FFmpeg/yt-dlp. The existing one-minute pause screen and WLED shutdown still
+apply. An expired pause timer waits for a fresh HA state before turning off.
+Starting while idle does not search YouTube or take over WLED.
+
+### Privacy and Service Limitations
+
+This feature is disabled by default and uses **unofficial yt-dlp extraction**,
+not YouTube's supported embedded-player or Data API integration. YouTube may
+block requests or change extraction/challenge requirements without notice.
+Future fixes require an app release; dependencies are not auto-updated while
+the app runs. Unavailable videos simply leave the other pages in the cycle.
+
+Enabling it sends artist/title searches, video requests, and your connection's
+public IP address to YouTube/Google. HA and MA tokens are not supplied to
+yt-dlp, FFmpeg, or YouTube. No API key, cookies, login, DRM, age, or geographical
+restriction bypass settings are included. Only use content you are authorized
+to access and comply with applicable service terms and local law. YouTube's
+terms and developer policies can restrict extraction outside supported players;
+the feature is not endorsed by YouTube and does not establish permission to
+download or display content.
+
+If no video appears, check app logs for a matched/unavailable message, artist
+and title metadata, internet access, the DDP setting, and extraction failures.
+The logs deliberately omit signed stream URLs and extractor stderr. Try a
+different track after a failed lookup, or wait five minutes. Falling back to
+other pages is expected when no suitable stream can be obtained.
 
 ## Choosing the Output Protocol
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.0
+
+- Add an optional YouTube video page after cover, artist photos, track information, and equalizer.
+- Use unofficial yt-dlp extraction to match artist/title and reject obvious covers, alternate versions, and duration mismatches.
+- Package FFmpeg, Node.js, and yt-dlp's bundled challenge scripts; decode silent 64x64 RGB frames on the HA host and send through DDP with shared rotation.
+- Add `show_video` (off by default), `video_fps` (10, range 5-20), `video_fit` (contain/cover), and `video_offset` (-60 to 60 seconds). Video requires DDP.
+- Follow HA playback position with best-effort seeking; cancel decoding on player/track changes, pause, and shutdown.
+- Cache matching IDs, refresh stream URLs, and skip unavailable or stale video without interrupting the other pages.
+- Keep HA polling asynchronous in video mode and preserve pause-then-off safety during slow requests.
+- Test real FFmpeg motion/scaling, DDP output and rotation, credential isolation, bounded metadata, cancellation, and slow polls.
+- Document unofficial-service limitations, privacy, CPU/network requirements, and timing differences between music videos and audio tracks.
+
 ## 0.8.1
 
 - Add a GitHub documentation gallery covering album artwork, three artist images, track information, equalizer, and the pause screen.

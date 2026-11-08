@@ -1,6 +1,7 @@
 # Architecture
 
 The app is a single Python process in a container. It has no web UI,
+and optionally launches yt-dlp/Node.js and FFmpeg subprocesses for video. It has no
 HA configuration mounts, or dependency on Dasher. Host networking allows an
 optional UDP multicast listener for Audio Sync. Options are supplied
 by Supervisor in `/data/options.json`.
@@ -34,6 +35,55 @@ WLED handles physical matrix mapping. The app changes the current effect but
 does not write presets or upload files to the controller's flash storage.
 
 ## Caching and Recovery
+
+### YouTube Video
+
+`show_video` is opt-in and requires DDP. `VideoPage` selects the latest playing
+MA entity with artist/title independently of artwork availability. Its key
+includes entity, media ID, artist, and title; changes cancel/await old work and
+clear the current frame. Normal rendering still needs a selected cover player.
+
+An asynchronous worker runs yt-dlp as a subprocess, using flat `ytsearch5`
+metadata followed by full resolution of up to three conservative artist/title
+and duration matches. Search metadata is capped at 2 MiB, each extraction at
+45 seconds, and the lookup overall at 90 seconds. The 32-entry in-memory LRU
+stores video IDs for 24 hours or negative results for five minutes. It does not
+cache signed URLs; candidates are revalidated and re-resolved on worker start.
+Only HTTPS streams under `*.googlevideo.com`, without URL credentials or
+nonstandard ports, are accepted. Formats are direct HTTPS video at most 360p.
+
+The container bundles yt-dlp with its matching EJS scripts and Node.js 22+;
+`--js-runtimes node` enables the runtime without remote-component downloads.
+Subprocesses receive only PATH, a temporary HOME, and LANG, not Supervisor/MA
+tokens. Arguments are passed directly without a shell; yt-dlp ignores user
+configuration and does not use cookies/login. Extractor stderr and signed URLs
+are not logged. Only a narrow set of sanitized public HTTP headers is passed
+to FFmpeg; authentication and cookie headers are excluded.
+
+FFmpeg decodes one stream at a time, discards audio, scales/pads or crops to
+64x64, and emits `rgb24` over stdout at 5-20 FPS. Decode/filter threads are
+limited to one. The worker reads exactly 12,288 bytes per frame with a 15-second
+timeout, paces against an extrapolated HA playback anchor plus `video_offset`,
+drops late frames, and reseeks on timing discontinuities over two seconds.
+Only the latest Pillow frame is retained. Stale frames (two seconds) and failed
+streams disappear from the page cycle; errors back off five minutes and normal
+EOF disables video until the track key changes. Music-video edits and speaker
+latency make synchronization best-effort.
+
+The shared renderer inserts video last, after cover/photos/info/EQ, and shared
+rotation transforms the completed frame before DDP serialization. Background
+HA polling in video mode prevents a slow state request from blocking animation.
+Only one state request is outstanding; its result is consumed before scheduling
+the next. Pause-timeout shutdown requires fresh HA state. Existing non-video
+polling/upload behavior remains unchanged.
+
+Track changes, pause, idle, and shutdown cancel/await the worker. Process
+creation is shielded so cancellation still reaps a just-created process.
+Shutdown drains stdout while terminating to avoid full-pipe deadlocks, then
+kills/reaps a process that does not exit in two seconds. Optional video failure
+does not change MA playback or interfere with the existing pause screen/off.
+Queries expose artist/title and the public client IP to YouTube; unofficial
+extraction is subject to service changes, access rights, and applicable terms.
 
 ### Artist Photos
 
@@ -190,3 +240,11 @@ Artist-page tests cover page order and limits, MA command shapes, public/proxy
 credential isolation, duplicate images, failed/ambiguous/missing library matches,
 negative-cache expiry, artist changes, DDP rotation, unchanged-cover reuse, slow
 background requests, and cancellation at shutdown.
+
+Video tests cover conservative matches, page order/fallback, ID-only cache and
+fresh URL resolution, unsafe stream rejection, subprocess credential isolation,
+bounded metadata, spawn cancellation, terminate/kill/reap, HA position anchors,
+configuration validation, actual FFmpeg moving-frame decoding with both fit
+modes, DDP rotation, stale frames, pause cleanup, fresh-state shutdown safety,
+and animation during slow HA polls. Generated test media is served locally;
+tests do not call YouTube or require a physical panel.

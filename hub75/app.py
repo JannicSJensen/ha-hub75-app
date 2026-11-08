@@ -6,9 +6,11 @@ import json
 import logging
 import math
 import os
+import re
 import signal
 import socket
 import struct
+import sys
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -27,6 +29,39 @@ DDP_PAYLOAD_BYTES = 1440
 AUDIO_SYNC_GROUP = "239.0.0.1"
 AUDIO_SYNC_PACKET = struct.Struct("<6s2sffBB16sHff")
 Image.MAX_IMAGE_PIXELS = 16 * 1024 * 1024
+
+
+def matching_videos(entries, artist, title, duration=0):
+    def words(value):
+        return set(re.findall(r"[^\W_]+", str(value or "").casefold()))
+
+    artist_words, title_words = words(artist), words(title)
+    if not artist_words or not title_words:
+        return []
+    matches = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not re.fullmatch(r"[A-Za-z0-9_-]{11}", str(entry.get("id", ""))):
+            continue
+        video_words = words(entry.get("title"))
+        identity_words = video_words | words(entry.get("channel")) | words(entry.get("uploader"))
+        unwanted = {"cover", "karaoke", "reaction", "tutorial", "remix", "live", "sped", "slowed"}
+        if (not title_words <= video_words or not artist_words <= identity_words
+                or (video_words & unwanted) - (artist_words | title_words)
+                or entry.get("is_live") or entry.get("live_status") in ("is_live", "is_upcoming")):
+            continue
+        try:
+            length = float(entry.get("duration") or 0)
+            expected = float(duration or 0)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(length) or not math.isfinite(expected):
+            continue
+        difference = abs(length - expected) if length > 0 and expected > 0 else 0
+        if difference > max(30, expected * 0.15):
+            continue
+        score = (bool(video_words & {"official"}), -difference)
+        matches.append((score, entry))
+    return [entry for _, entry in sorted(matches, key=lambda match: match[0], reverse=True)]
 
 
 def select_player(states, allowed_entities, require_picture=True):
@@ -127,16 +162,18 @@ def render_equalizer(spectrum):
 
 
 def render_frame(cover, player, scroll_seconds=0, now=None, page_interval=8,
-                 equalizer=None, show_track_info=True, artist_images=()):
+                 equalizer=None, show_track_info=True, artist_images=(), video=None):
     elapsed = max(0, scroll_seconds)
     artist_images = artist_images[:3]
-    page_count = 1 + len(artist_images) + bool(show_track_info) + (equalizer is not None)
+    page_count = 1 + len(artist_images) + bool(show_track_info) + (equalizer is not None) + (video is not None)
     page_index = int(elapsed // page_interval) % page_count
     if page_index == 0:
         return cover.copy()
     if page_index <= len(artist_images):
         return artist_images[page_index - 1].copy()
-    if equalizer is not None and page_index == page_count - 1:
+    if video is not None and page_index == page_count - 1:
+        return video.copy()
+    if equalizer is not None and page_index == page_count - 1 - (video is not None):
         return render_equalizer(equalizer)
     completed_cycles = elapsed // (page_count * page_interval)
     scroll_seconds = completed_cycles * page_interval + elapsed % page_interval
@@ -265,6 +302,222 @@ class AudioSyncReceiver(asyncio.DatagramProtocol):
         self.clear()
 
 
+class VideoPage:
+    def __init__(self, fps=10, fit="contain", offset=0):
+        self.fps = int(fps)
+        self.fit = fit
+        self.offset = int(offset)
+        if not 5 <= self.fps <= 20 or fit not in ("contain", "cover") or not -60 <= self.offset <= 60:
+            raise ValueError("Video needs 5-20 FPS, contain/cover fit, and an offset between -60 and 60")
+        self.key = None
+        self.task = None
+        self.process = None
+        self.frame = None
+        self.frame_time = 0
+        self.position = 0
+        self.position_time = time.monotonic()
+        self.retry_at = 0
+        self.cache = OrderedDict()
+
+    def current_frame(self):
+        return self.frame if time.monotonic() - self.frame_time < 2 else None
+
+    def desired_position(self):
+        return max(0, self.position + time.monotonic() - self.position_time + self.offset)
+
+    async def update(self, player):
+        attributes = player.get("attributes", {})
+        artist = " ".join(str(attributes.get("media_artist") or "").split())
+        title = " ".join(str(attributes.get("media_title") or "").split())
+        key = ((player.get("entity_id"), attributes.get("media_content_id"), artist.casefold(), title.casefold())
+               if player.get("state") == "playing" and artist and title else None)
+        if key != self.key:
+            await self.close()
+            self.key = key
+            self.retry_at = 0
+        if key is None:
+            return
+        try:
+            position = float(attributes.get("media_position") or 0)
+            if not math.isfinite(position):
+                position = 0
+            timestamp = attributes.get("media_position_updated_at") or player.get("last_updated")
+            if timestamp:
+                updated = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=timezone.utc)
+                position += max(0, (datetime.now(timezone.utc) - updated).total_seconds())
+        except (TypeError, ValueError, AttributeError):
+            position = 0
+        self.position = max(0, position)
+        self.position_time = time.monotonic()
+        if (self.task is None or self.task.done()) and time.monotonic() >= self.retry_at:
+            self.task = asyncio.create_task(self.run(artist, title, attributes.get("media_duration")))
+
+    async def stop_process(self):
+        process = self.process
+        self.process = None
+        if process is not None and process.returncode is None:
+            async def drain_output():
+                while await process.stdout.read(65536):
+                    pass
+
+            draining = asyncio.create_task(drain_output())
+            with suppress(ProcessLookupError):
+                process.terminate()
+            try:
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=2)
+                except TimeoutError:
+                    with suppress(ProcessLookupError):
+                        process.kill()
+                    await process.wait()
+            finally:
+                draining.cancel()
+                await asyncio.gather(draining, return_exceptions=True)
+
+    async def close(self):
+        if self.task is not None:
+            self.task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.task
+            self.task = None
+        await self.stop_process()
+        self.frame = None
+        self.key = None
+
+    async def start_process(self, *arguments):
+        environment = {"PATH": os.environ.get("PATH", os.defpath), "HOME": "/tmp", "LANG": "C.UTF-8"}
+        creation = asyncio.create_task(asyncio.create_subprocess_exec(
+            *arguments, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL, env=environment, limit=65536))
+        try:
+            self.process = await asyncio.shield(creation)
+        except asyncio.CancelledError:
+            self.process = await creation
+            await self.stop_process()
+            raise
+        return self.process
+
+    async def extractor_json(self, target, flat=False):
+        arguments = [sys.executable, "-m", "yt_dlp", "--ignore-config", "--no-cache-dir",
+                     "--no-warnings", "--quiet", "--socket-timeout", "10", "--retries", "0",
+                     "--extractor-retries", "0", "--no-playlist", "--js-runtimes", "node",
+                     "--skip-download", "--dump-single-json"]
+        if flat:
+            arguments.append("--flat-playlist")
+        else:
+            arguments.extend(["--format", "bv[height<=360][protocol=https]/b[height<=360][protocol=https]"])
+        process = await self.start_process(*arguments, "--", target)
+        try:
+            async with asyncio.timeout(45):
+                data = bytearray()
+                while chunk := await process.stdout.read(65536):
+                    data.extend(chunk)
+                    if len(data) > 2 * 1024 * 1024:
+                        raise ValueError("Video metadata exceeds 2 MiB")
+                if await process.wait() != 0:
+                    raise RuntimeError("Video lookup failed")
+                result = json.loads(data)
+                if not isinstance(result, dict):
+                    raise ValueError("Invalid video metadata")
+                return result
+        finally:
+            await self.stop_process()
+
+    async def lookup(self, artist, title, duration):
+        cache_key = (artist.casefold(), title.casefold())
+        cached = self.cache.get(cache_key)
+        if cached is not None and cached[0] > time.monotonic():
+            self.cache.move_to_end(cache_key)
+            candidates = [{"id": cached[1]}] if cached[1] else []
+        else:
+            result = await self.extractor_json(f"ytsearch5:{artist[:200]} {title[:200]} official music video", flat=True)
+            candidates = matching_videos(result.get("entries") or [], artist, title, duration)[:3]
+        for candidate in candidates:
+            try:
+                result = await self.extractor_json("https://www.youtube.com/watch?v=" + candidate["id"])
+                if not matching_videos([result], artist, title, duration):
+                    continue
+                source = urlsplit(str(result.get("url") or ""))
+                if (source.scheme != "https" or not source.hostname
+                        or not source.hostname.endswith(".googlevideo.com")
+                        or source.username or source.password or source.port not in (None, 443)):
+                    continue
+                self.cache[cache_key] = (time.monotonic() + 86400, candidate["id"])
+                self.cache.move_to_end(cache_key)
+                return result
+            except (OSError, TimeoutError, ValueError, RuntimeError):
+                continue
+        self.cache[cache_key] = (time.monotonic() + 300, None)
+        self.cache.move_to_end(cache_key)
+        return None
+
+    async def run(self, artist, title, duration):
+        try:
+            async with asyncio.timeout(90):
+                result = await self.lookup(artist, title, duration)
+            while len(self.cache) > 32:
+                self.cache.popitem(last=False)
+            if result is None:
+                self.retry_at = time.monotonic() + 300
+                LOGGER.info("No matching video; keeping other pages")
+                return
+            LOGGER.info("Matched a YouTube video; decoding at %s FPS", self.fps)
+            await self.decode(result["url"], result.get("http_headers") or {})
+        except (OSError, TimeoutError, ValueError, RuntimeError, TypeError, KeyError) as error:
+            self.retry_at = time.monotonic() + 300
+            LOGGER.warning("Video unavailable (%s); keeping other pages", type(error).__name__)
+        finally:
+            await self.stop_process()
+            self.frame = None
+
+    async def decode(self, source, headers):
+        scaling = ("scale=64:64:force_original_aspect_ratio=decrease,pad=64:64:(ow-iw)/2:(oh-ih)/2:black"
+                   if self.fit == "contain" else
+                   "scale=64:64:force_original_aspect_ratio=increase,crop=64:64")
+        headers = headers if isinstance(headers, dict) else {}
+        safe_headers = "".join(f"{name}: {value}\r\n" for name, value in headers.items()
+                       if isinstance(name, str)
+                       and name.lower() in ("user-agent", "referer", "origin", "accept", "accept-language")
+                               and isinstance(value, str) and len(value) <= 4096
+                               and "\r" not in value and "\n" not in value)
+        while True:
+            origin = self.desired_position()
+            started = time.monotonic()
+            arguments = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                         "-threads", "1", "-filter_threads", "1", "-protocol_whitelist",
+                         "http,https,tcp,tls,httpproxy,crypto", "-ss", f"{origin:.3f}"]
+            if safe_headers:
+                arguments.extend(["-headers", safe_headers])
+            arguments.extend(["-i", source, "-an", "-sn", "-dn", "-vf", f"fps={self.fps},{scaling}",
+                              "-pix_fmt", "rgb24", "-threads", "1", "-f", "rawvideo", "pipe:1"])
+            process = await self.start_process(*arguments)
+            index = 0
+            try:
+                while True:
+                    try:
+                        data = await asyncio.wait_for(process.stdout.readexactly(64 * 64 * 3), timeout=15)
+                    except asyncio.IncompleteReadError:
+                        if await process.wait() != 0:
+                            raise RuntimeError("Video decoder failed")
+                        self.retry_at = math.inf
+                        return
+                    position = origin + index / self.fps
+                    index += 1
+                    desired = self.desired_position()
+                    if abs(origin + time.monotonic() - started - desired) > 2:
+                        self.frame = None
+                        break
+                    if position < desired - 1 / self.fps:
+                        continue
+                    await asyncio.sleep(max(0, position - desired))
+                    self.frame = Image.frombytes("RGB", (64, 64), data)
+                    self.frame_time = time.monotonic()
+            finally:
+                await self.stop_process()
+
+
 class ArtworkBridge:
     def __init__(self, session, options, token, ha_url="http://supervisor/core/api"):
         self.session = session
@@ -277,6 +530,12 @@ class ArtworkBridge:
         self.output_protocol = options.get("output_protocol", "http")
         if self.output_protocol not in ("http", "ddp"):
             raise ValueError("output_protocol must be http or ddp")
+        if options.get("show_video", False) and self.output_protocol != "ddp":
+            raise ValueError("show_video requires output_protocol: ddp")
+        self.video = (VideoPage(options.get("video_fps", 10), options.get("video_fit", "contain"),
+                                options.get("video_offset", 0)) if options.get("show_video", False) else None)
+        self.video_visible = False
+        self.ha_poll_task = None
         self.audio_sync = (AudioSyncReceiver(options.get("audio_sync_port", 11988),
                                              options.get("audio_sync_interface", "0.0.0.0"))
                            if options.get("show_equalizer", False) else None)
@@ -427,14 +686,19 @@ class ArtworkBridge:
         frame = self.cover
         if player is not None:
             await self.update_artist_images(player)
+        video_frame = self.video.current_frame() if self.video is not None else None
+        if self.video_visible != (video_frame is not None):
+            self.video_visible = video_frame is not None
+            self.scroll_started = time.monotonic()
         if player is not None and (self.options.get("show_track_info", True)
-                                   or self.audio_sync is not None or self.artist_images):
+                                   or self.audio_sync is not None or self.artist_images or video_frame is not None):
             frame = await asyncio.to_thread(
                 render_frame, self.cover, player, time.monotonic() - self.scroll_started,
                 page_interval=self.options.get("page_interval", 8),
                 equalizer=self.audio_sync.spectrum() if self.audio_sync is not None else None,
                 show_track_info=self.options.get("show_track_info", True),
                 artist_images=self.artist_images,
+                video=video_frame,
             )
         missing_frame = (self.last_ddp_frame is None if self.output_protocol == "ddp"
                          else self.last_chunks is None)
@@ -518,6 +782,12 @@ class ArtworkBridge:
         self.ddp_active = False
 
     async def close(self):
+        if self.ha_poll_task is not None:
+            self.ha_poll_task.cancel()
+            await asyncio.gather(self.ha_poll_task, return_exceptions=True)
+            self.ha_poll_task = None
+        if self.video is not None:
+            await self.video.close()
         if self.artist_task is not None:
             self.artist_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -576,13 +846,17 @@ class ArtworkBridge:
             return state.get("on") and segment.get("on") and info.get("live")
         return state.get("on") and segment.get("on") and segment.get("frz")
 
-    async def update(self, poll=True):
-        if poll:
-            states = await self.get_json(self.ha_url + "/states", self.ha_headers)
+    async def update(self, poll=True, states=None):
+        if poll or states is not None:
+            if states is None:
+                states = await self.get_json(self.ha_url + "/states", self.ha_headers)
             self.current_player = select_player(states, self.options.get("player_entities", []))
-            self.playback_active = select_player(
+            active_player = select_player(
                 states, self.options.get("player_entities", []), require_picture=False
-            ) is not None
+            )
+            self.playback_active = active_player is not None
+            if self.video is not None:
+                await self.video.update(active_player or {})
             if not self.playback_active and self.audio_sync is not None:
                 self.audio_sync.clear()
         if self.playback_active and self.pause_until is not None:
@@ -603,6 +877,9 @@ class ArtworkBridge:
                     self.pause_until = time.monotonic() + 60
                     LOGGER.info("Music paused; turning off WLED in 60 seconds")
                 elif self.owns_display and time.monotonic() >= self.pause_until:
+                    if self.video is not None and not poll and states is None:
+                        await self.keep_ddp_alive()
+                        return
                     await self.turn_off_display()
                     self.owns_display = False
                     self.pause_until = None
@@ -636,7 +913,7 @@ class ArtworkBridge:
                     self.last_chunks = None
                     self.last_ddp_frame = None
             cover_only = (not self.options.get("show_track_info", True)
-                          and self.audio_sync is None and not self.artist_enabled)
+                          and self.audio_sync is None and not self.artist_enabled and self.video is None)
             if healthy and cover_only:
                 if self.output_protocol == "http" or self.last_ddp_frame is not None:
                     await self.keep_ddp_alive()
@@ -648,6 +925,8 @@ class ArtworkBridge:
 
     def render_interval(self):
         if self.output_protocol == "ddp" and self.owns_display:
+            if self.current_player is not None and self.video is not None:
+                return 1 / max(self.video.fps, 20 if self.audio_sync is not None else 10)
             if self.current_player is not None and self.audio_sync is not None:
                 return 0.05
             return (0.1 if self.current_player is not None
@@ -676,7 +955,18 @@ class ArtworkBridge:
                         and time.monotonic() >= self.pause_until))
             succeeded = False
             try:
-                await self.update(poll=poll)
+                states = None
+                if self.video is not None:
+                    if self.ha_poll_task is not None and self.ha_poll_task.done():
+                        completed_poll = self.ha_poll_task
+                        self.ha_poll_task = None
+                        next_poll = time.monotonic() + self.options.get("refresh_interval", 5)
+                        states = await completed_poll
+                    if poll and states is None and self.ha_poll_task is None:
+                        self.ha_poll_task = asyncio.create_task(
+                            self.get_json(self.ha_url + "/states", self.ha_headers))
+                    poll = False
+                await self.update(poll=poll, states=states)
                 succeeded = True
             except aiohttp.ClientResponseError as error:
                 LOGGER.warning("HTTP %s from %s; retrying", error.status,
@@ -690,7 +980,9 @@ class ArtworkBridge:
             if poll:
                 next_poll = time.monotonic() + self.options.get("refresh_interval", 5)
             try:
-                interval = min(self.render_interval(), max(0.01, next_poll - time.monotonic()))
+                interval = self.render_interval()
+                if self.ha_poll_task is None:
+                    interval = min(interval, max(0.01, next_poll - time.monotonic()))
                 if not succeeded:
                     interval = max(1, interval)
                 await asyncio.wait_for(self.stopping.wait(),

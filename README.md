@@ -5,6 +5,8 @@ song title, artist, album, and remaining playing time on a 64x64 HUB75 matrix
 running WLED. No Dasher dependency, HA YAML automation, or manually created
 Home Assistant token is required. Core playback pages need no Music Assistant
 API token; optional artist photos use separate MA URL/token settings.
+An optional YouTube video page uses unofficial yt-dlp extraction and FFmpeg
+decoding on the HA host, with DDP output to WLED.
 
 ## Screens
 
@@ -24,7 +26,8 @@ your Music Assistant artwork replaces them during playback.
 | ![Music paused screen shown before shutdown](docs/screenshots/paused.png) | ![Animated equalizer using illustrative spectrum data](docs/screenshots/equalizer-animated.gif) |
 
 Playback order is cover, available artist images, track information, then
-equalizer. Artist images and the equalizer are optional. Long text scrolls;
+equalizer, then an available video. Artist images, the equalizer, and video are
+optional; the gallery above illustrates the non-video pages. Long text scrolls;
 the information preview captures the start of a scrolling row. The pause screen
 appears for one minute before WLED turns off. The equalizer animation uses
 illustrative spectrum values, not captured audio.
@@ -40,6 +43,8 @@ and instructions for updating these previews.
 - Network access from Home Assistant to the WLED controller.
 - For the optional equalizer, a Music Assistant version with WLED Audio Sync
 	and working multicast between Music Assistant and this app.
+- For optional video: DDP output, internet access to YouTube, and enough HA-host
+  CPU for FFmpeg decoding. FFmpeg, Node.js, and yt-dlp are bundled in the app.
 
 ## Install
 
@@ -85,16 +90,28 @@ Photos load in the background and are cached per artist. Missing or ambiguous
 library artists and failed images are skipped; duplicate photos are not repeated.
 See the [artist photo setup guide](hub75/DOCS.md#artist-photos).
 
-Enable `show_equalizer` to add the final page with 16 live spectrum bars. Set
+Enable `show_equalizer` to add a page with 16 live spectrum bars. Set
 `audio_sync_port` to the Music Assistant WLED Audio Sync zone's port (default
 11988) and group that zone with the speaker being followed. The app receives
 analysis data, not audio, and renders it at up to 20 FPS with DDP. No microphone
 or Audio Reactive firmware is needed on the panel. See the
 [Audio Sync setup guide](hub75/DOCS.md#equalizer-and-music-assistant-audio-sync).
 
+Enable `show_video` with `output_protocol: ddp` to add a matching YouTube video
+as the final page. The app searches the current artist/title, checks identity
+and duration, and skips unavailable matches. FFmpeg decodes silent 64x64 frames
+at 10 FPS by default; `video_fit` selects letterboxing or cropping, and
+`video_offset` adjusts best-effort alignment to HA playback. Music-video intros
+and edits may differ from the audio track. This is unofficial extraction, not
+an endorsed YouTube integration, and may break when YouTube changes. Queries
+send artist/title and your connection's IP address to YouTube. Use only content
+you are authorized to access and comply with the applicable terms. No cookies,
+login, DRM, age, or region bypass options are provided. See the
+[video setup and limitations](hub75/DOCS.md#youtube-video-page).
+
 The countdown advances every second on the information page using HA's playback
 position timestamp between HA polls; live streams without a duration show
-`--:--`. Disable `show_artist_images`, `show_track_info`, and `show_equalizer`
+`--:--`. Disable `show_artist_images`, `show_track_info`, `show_equalizer`, and `show_video`
 to show only the full-screen cover.
 
 Use the `rotation` dropdown to rotate all pages clockwise by 0, 45, 90, 135,
@@ -133,7 +150,9 @@ python3 -m venv .venv
 docker build -t ha-hub75-app:dev hub75
 ```
 
-The tests validate the HA manifest and run against mock HTTP servers and a local
+Install FFmpeg locally for the real decoder tests. The tests validate the HA
+manifest and run against mock HTTP servers, generated video, and a local
 UDP receiver, with no HA
 credentials or physical display required. CI tests Python 3.13 and builds both
-CPU architectures. The configured app version is `0.8.1`.
+CPU architectures. The configured app version is `0.9.0`. The tests do not
+contact YouTube or require a physical panel.
