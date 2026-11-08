@@ -14,10 +14,13 @@ by Supervisor in `/data/options.json`.
 4. Download the `entity_picture`. Relative `/api/` pictures use the Supervisor
    proxy; absolute HTTP/HTTPS pictures are fetched without the Supervisor token.
 5. Use Pillow to apply EXIF orientation, preserve aspect ratio, pad to 64x64,
-   and composite transparency onto black.
+   and composite transparency onto black. Cache the decoded cover. With
+   `show_track_info`, compose a 28x28 cover and four nine-pixel text rows for
+   title, artist, album, and remaining time.
 6. Verify WLED reports a 64x64 matrix. Turn it on and configure segment 0 in a
    separate request before writing pixels, preserving its existing brightness.
-7. Upload 16 sequential 256-pixel JSON requests to WLED `/json/state`.
+7. Upload 16 sequential 256-pixel JSON requests to WLED `/json/state` for an
+   initial frame. Subsequent frames only upload chunks whose pixels changed.
 
 WLED's individual-pixel control freezes segment 0. Pixels are row-major;
 WLED handles physical matrix mapping. The app changes the current effect but
@@ -25,8 +28,14 @@ does not write presets or upload files to the controller's flash storage.
 
 ## Caching and Recovery
 
-The last successfully uploaded artwork URL is cached in memory. An unchanged
-URL skips conversion and upload. Every 30 seconds, the app checks that WLED is
+The artwork URL, decoded cover, and last successful frame's chunks are cached in
+memory. Unchanged artwork is not downloaded again. With track information
+enabled, a one-second render loop interpolates elapsed playback from HA's
+position timestamp, updates the countdown, and scrolls long text. HA state
+polling retains its independently configured interval. A track/player/metadata
+change resets the scroll position even when the cover URL is unchanged.
+
+Full-cover mode skips unchanged frames entirely. Every 30 seconds, the app checks that WLED is
 on and segment 0 is on and frozen. An unhealthy state triggers another upload.
 Cache state resets when no eligible player remains or the app restarts.
 
@@ -60,5 +69,6 @@ cannot be distinguished from this app's own image.
 `tests/test_app.py` covers manifest structure and version/changelog consistency,
 player selection, pixel ordering, padding, transparency, token isolation,
 unchanged-artwork caching, restart recovery, idle behavior, rejected uploads,
-incorrect matrix dimensions, and oversized downloads. HTTP integration tests
+incorrect matrix dimensions, oversized downloads, countdown extrapolation,
+metadata layout, scrolling, and incremental frame uploads. HTTP integration tests
 use in-process aiohttp servers without HA credentials or real hardware.

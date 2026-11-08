@@ -1,7 +1,8 @@
 # HUB75 Album Artwork
 
-A standalone Home Assistant app that displays Music Assistant album artwork on
-a 64x64 HUB75 matrix running WLED. No Dasher dependency, HA YAML automation,
+A standalone Home Assistant app that displays Music Assistant album artwork,
+song title, artist, album, and remaining playing time on a 64x64 HUB75 matrix
+running WLED. No Dasher dependency, HA YAML automation,
 Music Assistant API key, or manually created Home Assistant token is required.
 
 ## Requirements
@@ -42,8 +43,15 @@ share one display, so the most recent player takes precedence. If it stops,
 another playing player takes over. Artwork changes cause a new upload; position
 and volume updates do not.
 
-Artwork is fitted to 64x64 with black padding and sent as 16 sequential pixel
-requests. Current brightness is preserved. When playback stops, the last cover
+The default layout shows a 28x28 cover above three text lines (title, artist,
+album) and a remaining-time countdown. Long text scrolls horizontally. The
+countdown advances every second using HA's playback position timestamp between
+HA polls; live streams without a duration show `--:--`. Set `show_track_info`
+to `false` to restore the original full-cover 64x64 layout.
+
+Initial frames are sent as 16 sequential pixel requests. Subsequent text and
+countdown frames send only changed chunks without downloading the cover again.
+Current brightness is preserved. When playback stops, the last frame
 remains visible by default; `idle_action: off` turns the display off instead.
 While music is playing, a health check every 30 seconds restores artwork after a
 WLED restart or a change to its current effect.
@@ -63,4 +71,4 @@ docker build -t ha-hub75-app:dev hub75
 
 The tests validate the HA manifest and run against mock HTTP servers, with no HA
 credentials or physical display required. CI tests Python 3.13 and builds both
-CPU architectures. The configured app version is `0.1.0`.
+CPU architectures. The configured app version is `0.2.0`.

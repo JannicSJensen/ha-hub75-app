@@ -4,6 +4,7 @@
 display_url: http://192.168.2.214
 player_entities: []
 idle_action: keep
+show_track_info: true
 refresh_interval: 5
 log_level: info
 ```
@@ -13,6 +14,7 @@ log_level: info
 | `display_url` | WLED controller base URL. Default is your wall_01 controller. |
 | `player_entities` | Optional list of Music Assistant HA media-player IDs. Empty means all MA players. |
 | `idle_action` | `keep` leaves the last cover visible; `off` turns WLED off when no eligible player remains. |
+| `show_track_info` | Show a compact cover, title, artist, album, and countdown. Set `false` for a full-cover image. Default: `true`. |
 | `refresh_interval` | Seconds between HA checks, from 1 to 60. Default: 5. |
 | `log_level` | `debug`, `info`, `warning`, or `error`. Default: `info`. |
 
@@ -34,6 +36,26 @@ player_entities:
 With multiple players, the one whose state most recently changed to `playing`
 wins. Players without artwork are skipped. When no eligible player remains,
 `idle_action` applies. The app does not start, pause, or change music playback.
+
+## Track Information
+
+The default layout places a 28x28 cover at the top, followed by the song title
+in white, artist in cyan, album in gold, and remaining time in green. Text lines
+that do not fit scroll horizontally, starting after a two-second reading pause.
+Each row is clipped to its own area so it cannot overlap neighboring rows.
+
+Remaining time is calculated from `media_duration`, `media_position`, and
+`media_position_updated_at`. The app advances the countdown once per second
+between HA polls, then resynchronizes when HA supplies a new position. Seeking
+or changing tracks is reflected on the next HA poll. The countdown stops at
+`-0:00`; live streams and unknown durations show `--:--`. Missing metadata leaves
+its corresponding line blank. If no eligible player remains, the last rendered
+frame stays visible with `idle_action: keep`, including its last countdown value.
+
+Updating from 0.1.0 enables this layout by default. Set `show_track_info: false`
+and restart the app if you prefer the original 64x64 cover. The HA polling
+interval still defaults to five seconds; the text/countdown render loop runs
+separately at one-second intervals and only uploads changed pixel chunks.
 
 ## WLED Setup
 

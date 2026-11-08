@@ -4,14 +4,16 @@ import asyncio
 import io
 import json
 import logging
+import math
 import os
 import signal
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import aiohttp
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 LOGGER = logging.getLogger("hub75")
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
@@ -32,14 +34,71 @@ def select_player(states, allowed_entities):
     ), default=None)
 
 
-def pixel_chunks(image_bytes):
+def load_cover(image_bytes):
     with Image.open(io.BytesIO(image_bytes)) as source:
         image = ImageOps.exif_transpose(source).convert("RGBA")
         image = ImageOps.pad(image, (64, 64), Image.Resampling.LANCZOS)
         background = Image.new("RGBA", image.size, (0, 0, 0, 255))
         background.alpha_composite(image)
-        colors = ["%02x%02x%02x" % pixel
-                  for pixel in background.convert("RGB").getdata()]
+        return background.convert("RGB")
+
+
+def remaining_time(player, now=None):
+    attributes = player.get("attributes", {})
+    try:
+        duration = float(attributes.get("media_duration", 0))
+        position = float(attributes.get("media_position", 0))
+    except (TypeError, ValueError):
+        return "--:--"
+    if not math.isfinite(duration) or not math.isfinite(position) or duration <= 0:
+        return "--:--"
+    timestamp = attributes.get("media_position_updated_at") or player.get("last_updated")
+    if player.get("state") == "playing" and timestamp:
+        try:
+            updated = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=timezone.utc)
+            position += max(0, ((now or datetime.now(timezone.utc)) - updated).total_seconds())
+        except (TypeError, ValueError, AttributeError):
+            pass
+    seconds = math.ceil(max(0, duration - max(0, position)))
+    minutes, seconds = divmod(seconds, 60)
+    if minutes >= 60:
+        hours, minutes = divmod(minutes, 60)
+        return f"-{hours}:{minutes:02}:{seconds:02}"
+    return f"-{minutes}:{seconds:02}"
+
+
+def render_frame(cover, player, scroll_seconds=0, now=None):
+    frame = Image.new("RGB", (64, 64), "black")
+    frame.paste(cover.resize((28, 28), Image.Resampling.LANCZOS), (18, 0))
+    font = ImageFont.load_default(size=8)
+    attributes = player.get("attributes", {})
+    lines = (
+        (attributes.get("media_title") or "", "white"),
+        (attributes.get("media_artist") or "", "#73dce8"),
+        (attributes.get("media_album_name") or "", "#efc871"),
+        (remaining_time(player, now), "#93e9ac"),
+    )
+    for index, (text, color) in enumerate(lines):
+        text = " ".join(str(text).split())[:512]
+        row = Image.new("RGB", (64, 9), "black")
+        draw = ImageDraw.Draw(row)
+        width = math.ceil(draw.textlength(text, font=font))
+        top = font.getbbox(text)[1] if text else 0
+        if width > 64:
+            offset = int(max(0, scroll_seconds - 2) * 6) % (width + 16)
+            draw.text((-offset, -top), text, font=font, fill=color)
+            draw.text((width + 16 - offset, -top), text, font=font, fill=color)
+        else:
+            draw.text(((64 - width) // 2, -top), text, font=font, fill=color)
+        frame.paste(row, (0, 28 + index * 9))
+    return frame
+
+
+def pixel_chunks(image_bytes):
+    image = image_bytes if isinstance(image_bytes, Image.Image) else load_cover(image_bytes)
+    colors = ["%02x%02x%02x" % pixel for pixel in image.convert("RGB").getdata()]
     return [
         {"seg": [{"id": 0, "i": [offset, *colors[offset:offset + 256]]}]}
         for offset in range(0, len(colors), 256)
@@ -58,6 +117,12 @@ class ArtworkBridge:
         self.last_artwork = None
         self.last_health_check = 0
         self.owns_display = False
+        self.current_player = None
+        self.cover = None
+        self.cover_url = None
+        self.last_chunks = None
+        self.track_key = None
+        self.scroll_started = time.monotonic()
         self.stopping = asyncio.Event()
 
     async def get_json(self, url, headers=None):
@@ -92,26 +157,39 @@ class ArtworkBridge:
                     raise ValueError("Artwork exceeds 10 MiB")
         return bytes(image_bytes)
 
-    async def display_artwork(self, picture):
-        image_bytes = await self.fetch_artwork(picture)
-        chunks = await asyncio.to_thread(pixel_chunks, image_bytes)
+    async def display_artwork(self, picture, player=None):
+        if picture != self.cover_url:
+            image_bytes = await self.fetch_artwork(picture)
+            self.cover = await asyncio.to_thread(load_cover, image_bytes)
+            self.cover_url = picture
+        frame = self.cover
+        if player is not None and self.options.get("show_track_info", True):
+            frame = await asyncio.to_thread(
+                render_frame, self.cover, player, time.monotonic() - self.scroll_started
+            )
+        chunks = await asyncio.to_thread(pixel_chunks, frame)
+        full_update = self.last_chunks is None or picture != self.last_artwork
         async with asyncio.timeout(45):
-            info = await self.get_json(self.display_url + "/json/info")
-            if info.get("leds", {}).get("matrix") != {"w": 64, "h": 64}:
-                raise ValueError("WLED must be configured as a 64x64 matrix")
-            await self.post_state({
-                "on": True, "tt": 0,
-                "seg": [{
-                    "id": 0, "on": True, "start": 0, "stop": 64,
-                    "startY": 0, "stopY": 64, "grp": 1, "spc": 0, "of": 0,
-                    "rev": False, "rY": False, "mi": False, "mY": False,
-                    "tp": False, "m12": 0, "fx": 0,
-                }],
-            })
-            for chunk in chunks:
-                await self.post_state(chunk)
+            if full_update:
+                info = await self.get_json(self.display_url + "/json/info")
+                if info.get("leds", {}).get("matrix") != {"w": 64, "h": 64}:
+                    raise ValueError("WLED must be configured as a 64x64 matrix")
+                await self.post_state({
+                    "on": True, "tt": 0,
+                    "seg": [{
+                        "id": 0, "on": True, "start": 0, "stop": 64,
+                        "startY": 0, "stopY": 64, "grp": 1, "spc": 0, "of": 0,
+                        "rev": False, "rY": False, "mi": False, "mY": False,
+                        "tp": False, "m12": 0, "fx": 0,
+                    }],
+                })
+            for index, chunk in enumerate(chunks):
+                if full_update or chunk != self.last_chunks[index]:
+                    await self.post_state(chunk)
+        self.last_chunks = chunks
         self.owns_display = True
-        self.last_health_check = time.monotonic()
+        if full_update:
+            self.last_health_check = time.monotonic()
 
     async def display_is_healthy(self):
         state = await self.get_json(self.display_url + "/json/state")
@@ -120,30 +198,49 @@ class ArtworkBridge:
         self.last_health_check = time.monotonic()
         return state.get("on") and segment.get("on") and segment.get("frz")
 
-    async def update(self):
-        states = await self.get_json(self.ha_url + "/states", self.ha_headers)
-        player = select_player(states, self.options.get("player_entities", []))
+    async def update(self, poll=True):
+        if poll:
+            states = await self.get_json(self.ha_url + "/states", self.ha_headers)
+            self.current_player = select_player(states, self.options.get("player_entities", []))
+        player = self.current_player
         if player is None:
             if self.options.get("idle_action", "keep") == "off" and self.owns_display:
                 await self.post_state({"on": False})
                 self.owns_display = False
             self.last_artwork = None
+            self.last_chunks = None
+            self.track_key = None
             return
         picture = player["attributes"]["entity_picture"]
+        attributes = player["attributes"]
+        track_key = (player["entity_id"], picture, attributes.get("media_content_id"),
+                     attributes.get("media_title"), attributes.get("media_artist"),
+                     attributes.get("media_album_name"))
+        if track_key != self.track_key:
+            self.scroll_started = time.monotonic()
+            self.track_key = track_key
         if picture == self.last_artwork:
-            if time.monotonic() - self.last_health_check < 30:
+            healthy = True
+            if time.monotonic() - self.last_health_check >= 30:
+                healthy = await self.display_is_healthy()
+                if not healthy:
+                    self.last_chunks = None
+            if healthy and not self.options.get("show_track_info", True):
                 return
-            if await self.display_is_healthy():
-                return
-        await self.display_artwork(picture)
+        await self.display_artwork(picture, player)
+        if picture != self.last_artwork:
+            LOGGER.info("Updated album artwork from %s", player["entity_id"])
         self.last_artwork = picture
-        LOGGER.info("Updated album artwork from %s", player["entity_id"])
 
     async def run(self):
         LOGGER.info("Watching Music Assistant; WLED target: %s", self.display_url)
+        next_poll = 0
         while not self.stopping.is_set():
             try:
-                await self.update()
+                poll = time.monotonic() >= next_poll
+                await self.update(poll=poll)
+                if poll:
+                    next_poll = time.monotonic() + self.options.get("refresh_interval", 5)
             except aiohttp.ClientResponseError as error:
                 LOGGER.warning("HTTP %s from %s; retrying", error.status,
                                error.request_info.real_url.host)
@@ -153,7 +250,8 @@ class ArtworkBridge:
                 LOGGER.debug("Failure details", exc_info=True)
             try:
                 await asyncio.wait_for(self.stopping.wait(),
-                                       timeout=self.options.get("refresh_interval", 5))
+                                       timeout=1 if self.options.get("show_track_info", True)
+                                       else self.options.get("refresh_interval", 5))
             except TimeoutError:
                 pass
 

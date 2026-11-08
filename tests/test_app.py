@@ -2,7 +2,9 @@ import importlib.util
 import io
 import re
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import aiohttp
 import yaml
@@ -38,6 +40,7 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(set(config["options"]), set(config["schema"]))
         self.assertTrue(config["homeassistant_api"])
         self.assertTrue(config["init"])
+        self.assertTrue(config["options"]["show_track_info"])
         self.assertNotIn("image", config)
         self.assertRegex(config["version"], r"^\d+\.\d+\.\d+$")
         changelog = (root / "hub75" / "CHANGELOG.md").read_text()
@@ -88,6 +91,53 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(colors[33], "800000")
 
 
+class TrackInfoTests(unittest.TestCase):
+    def test_countdown_uses_position_timestamp_and_clamps_at_zero(self):
+        selected = player()
+        selected["attributes"].update(media_duration=240, media_position=60,
+                                      media_position_updated_at="2026-11-08T12:00:00Z")
+        now = datetime(2026, 11, 8, 12, 0, 10, tzinfo=timezone.utc)
+        self.assertEqual(APP.remaining_time(selected, now), "-2:50")
+        selected["attributes"]["media_position"] = 300
+        self.assertEqual(APP.remaining_time(selected, now), "-0:00")
+        selected["state"] = "paused"
+        selected["attributes"]["media_position"] = 60
+        self.assertEqual(APP.remaining_time(selected, now), "-3:00")
+
+    def test_unknown_duration_and_long_tracks(self):
+        selected = player()
+        self.assertEqual(APP.remaining_time(selected), "--:--")
+        for duration in (None, "unavailable", float("nan"), float("inf"), 0):
+            selected["attributes"]["media_duration"] = duration
+            self.assertEqual(APP.remaining_time(selected), "--:--")
+        selected["attributes"].update(media_duration=3661, media_position=0)
+        self.assertEqual(APP.remaining_time(selected), "-1:01:01")
+
+    def test_all_four_text_rows_and_cover_fit_panel(self):
+        selected = player()
+        selected["attributes"].update(media_title="Paradise", media_artist="Coldplay",
+                                      media_album_name="Mylo Xyloto", media_duration=240)
+        frame = APP.render_frame(Image.new("RGB", (64, 64), "red"), selected)
+        self.assertEqual(frame.size, (64, 64))
+        self.assertEqual(frame.getpixel((18, 0)), (255, 0, 0))
+        for top in (28, 37, 46, 55):
+            self.assertIsNotNone(frame.crop((0, top, 64, top + 9)).getbbox())
+
+    def test_long_text_scrolls_without_touching_cover_or_timer(self):
+        selected = player()
+        selected["attributes"].update(media_title="A very long song title beyond the panel",
+                                      media_artist="Artist", media_album_name="Album")
+        cover = Image.new("RGB", (64, 64), "red")
+        first = APP.render_frame(cover, selected, 0)
+        later = APP.render_frame(cover, selected, 5)
+        self.assertNotEqual(first.crop((0, 28, 64, 37)).tobytes(),
+                            later.crop((0, 28, 64, 37)).tobytes())
+        self.assertEqual(first.crop((0, 0, 64, 28)).tobytes(),
+                         later.crop((0, 0, 64, 28)).tobytes())
+        self.assertEqual(first.crop((0, 55, 64, 64)).tobytes(),
+                         later.crop((0, 55, 64, 64)).tobytes())
+
+
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.states = [player()]
@@ -112,7 +162,8 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.base = f"http://127.0.0.1:{port}"
         self.session = aiohttp.ClientSession()
         self.bridge = APP.ArtworkBridge(self.session, {
-            "display_url": self.base, "player_entities": [], "idle_action": "keep"
+            "display_url": self.base, "player_entities": [], "idle_action": "keep",
+            "show_track_info": False,
         }, "supervisor-token", self.base + "/core/api")
 
     async def asyncTearDown(self):
@@ -202,6 +253,31 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "10 MiB"):
             await self.bridge.update()
         self.assertEqual(self.posts, [])
+
+    async def test_countdown_updates_only_changed_chunks_without_fetching_art(self):
+        self.bridge.options["show_track_info"] = True
+        self.states[0]["attributes"].update(media_title="Song", media_artist="Artist",
+                                            media_album_name="Album", media_duration=240)
+        with patch.object(APP, "remaining_time", return_value="-3:00"):
+            await self.bridge.update()
+        self.assertEqual(len(self.posts), 17)
+        self.posts.clear()
+        with patch.object(APP, "remaining_time", return_value="-2:59"):
+            await self.bridge.update(poll=False)
+        self.assertGreater(len(self.posts), 0)
+        self.assertLess(len(self.posts), 16)
+        self.assertTrue(all(payload["seg"][0]["i"][0] >= 3328 for payload in self.posts))
+        self.assertEqual(len(self.auth), 1)
+
+    async def test_new_song_on_same_album_updates_metadata_without_redownload(self):
+        self.bridge.options["show_track_info"] = True
+        self.states[0]["attributes"]["media_title"] = "First song"
+        await self.bridge.update()
+        self.posts.clear()
+        self.states[0]["attributes"]["media_title"] = "Second song"
+        await self.bridge.update()
+        self.assertGreater(len(self.posts), 0)
+        self.assertEqual(len(self.auth), 1)
 
 
 if __name__ == "__main__":
