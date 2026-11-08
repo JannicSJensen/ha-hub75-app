@@ -55,8 +55,13 @@ position timestamp between HA polls; live streams without a duration show
 
 Initial frames are sent as 16 sequential pixel requests. Subsequent text and
 countdown frames send only changed chunks without downloading the cover again.
-Current brightness is preserved. When playback stops, the last frame
-remains visible by default; `idle_action: off` turns the display off instead.
+Current brightness is preserved. When all selected Music Assistant players
+stop or pause, the display shows "music paused" for 60 seconds and then turns
+WLED off. Resuming music cancels the timer and restores playback; resuming after
+shutdown turns the display back on. This also works in cover-only mode.
+Set `pause_then_off: false` to use the older `idle_action` behavior (`keep` or
+immediate `off`) instead. Starting the app with no playing music does not take
+over an independently controlled display.
 While music is playing, a health check every 30 seconds restores artwork after a
 WLED restart or a change to its current effect.
 
@@ -75,4 +80,4 @@ docker build -t ha-hub75-app:dev hub75
 
 The tests validate the HA manifest and run against mock HTTP servers, with no HA
 credentials or physical display required. CI tests Python 3.13 and builds both
-CPU architectures. The configured app version is `0.3.0`.
+CPU architectures. The configured app version is `0.4.0`.

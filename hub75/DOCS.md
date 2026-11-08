@@ -4,6 +4,7 @@
 display_url: http://192.168.2.214
 player_entities: []
 idle_action: keep
+pause_then_off: true
 show_track_info: true
 page_interval: 8
 refresh_interval: 5
@@ -14,7 +15,8 @@ log_level: info
 | --- | --- |
 | `display_url` | WLED controller base URL. Default is your wall_01 controller. |
 | `player_entities` | Optional list of Music Assistant HA media-player IDs. Empty means all MA players. |
-| `idle_action` | `keep` leaves the last cover visible; `off` turns WLED off when no eligible player remains. |
+| `idle_action` | Used only when `pause_then_off` is `false`: `keep` leaves the last frame visible; `off` turns WLED off immediately. |
+| `pause_then_off` | Show "music paused" for 60 seconds after playback stops, then switch WLED off. Default: `true`. Overrides `idle_action`. |
 | `show_track_info` | Alternate cover and track-information pages. Set `false` for an uninterrupted full-cover image. Default: `true`. |
 | `page_interval` | Seconds each page remains visible, from 3 to 60. Default: 8. Ignored when `show_track_info` is `false`. |
 | `refresh_interval` | Seconds between HA checks, from 1 to 60. Default: 5. |
@@ -36,8 +38,33 @@ player_entities:
 ```
 
 With multiple players, the one whose state most recently changed to `playing`
-wins. Players without artwork are skipped. When no eligible player remains,
-`idle_action` applies. The app does not start, pause, or change music playback.
+wins. Players without artwork are skipped for cover selection, but still count
+as playing so a temporary missing cover does not trigger a pause screen. The
+app does not start, pause, or change music playback.
+
+## Pause and Shutdown
+
+With `pause_then_off: true`, once all selected Music Assistant players stop,
+pause, or become idle, the app displays "music paused" centered on two lines.
+The 60-second timer starts after the screen uploads successfully. It then sends
+WLED `on: false`. Repeated idle updates do not restart the timer or wake the
+display after shutdown. This behavior also works with `show_track_info: false`.
+
+Resuming any selected player cancels the timer and restores the playing display
+starting with the cover page. Resuming after shutdown turns WLED back on. If
+another selected player is still playing, its cover takes over instead of
+showing the pause message. Playback changes are detected on the next HA poll.
+
+Starting the app while music is already idle does not take over or turn off an
+unrelated WLED display. The pause timer is in memory and is canceled by an app
+restart. Failed screen uploads and power-off requests are retried; power-off
+failures do not restart the one-minute countdown. If HA cannot be reached at
+the deadline, the app retries rather than turning off without checking whether
+playback has resumed.
+
+Updating from 0.3.0 enables this behavior by default, even if `idle_action` was
+previously `keep`. Set `pause_then_off: false` and restart the app to retain the
+old `idle_action` behavior.
 
 ## Track Information
 
@@ -58,8 +85,9 @@ Remaining time is calculated from `media_duration`, `media_position`, and
 between HA polls, then resynchronizes when HA supplies a new position. Seeking
 or changing tracks is reflected on the next HA poll. The countdown stops at
 `-0:00`; live streams and unknown durations show `--:--`. Missing metadata leaves
-its corresponding line blank. If no eligible player remains, the last rendered
-frame stays visible with `idle_action: keep`, including its last countdown value.
+its corresponding line blank. When playback stops, the pause screen replaces
+these pages by default. With `pause_then_off: false` and `idle_action: keep`, the
+last rendered frame stays visible, including its last countdown value.
 
 Updating from 0.2.0 replaces the compact layout with these two pages. Set
 `show_track_info: false` and restart the app for an uninterrupted 64x64 cover.

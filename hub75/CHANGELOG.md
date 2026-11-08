@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0
+
+- Show a centered "music paused" screen for 60 seconds when all selected players stop.
+- Turn WLED off after the pause minute and cancel shutdown if music resumes.
+- Restore the playing display automatically when music resumes after shutdown.
+- Add `pause_then_off`, enabled by default; disabling it retains `idle_action`.
+- Retry failed pause uploads and shutdown commands without prematurely starting or resetting the timer.
+- Avoid triggering pause behavior during temporary artwork loss or idle app startup.
+
 ## 0.3.0
 
 - Alternate between a full-screen album cover and a separate track-information page.

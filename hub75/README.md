@@ -7,6 +7,9 @@ page showing scrolling song title, artist, album, and a large live countdown.
 Each page is visible for eight seconds by default; configure `page_interval`
 to change this. Disable `show_track_info` for an uninterrupted album cover.
 
+When music stops or pauses, the app displays "music paused" for one minute,
+then turns WLED off. Resuming music cancels the shutdown and restores the cover.
+
 Set the controller's URL in the Configuration tab, then start the app. There is
 no separate web interface or Home Assistant automation to configure.
 

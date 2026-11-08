@@ -20,13 +20,13 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024
 Image.MAX_IMAGE_PIXELS = 16 * 1024 * 1024
 
 
-def select_player(states, allowed_entities):
+def select_player(states, allowed_entities, require_picture=True):
     candidates = [
         state for state in states
         if state["entity_id"].startswith("media_player.")
         and state.get("state") == "playing"
         and state.get("attributes", {}).get("app_id") == "music_assistant"
-        and state["attributes"].get("entity_picture")
+        and (not require_picture or state["attributes"].get("entity_picture"))
         and (not allowed_entities or state["entity_id"] in allowed_entities)
     ]
     return max(candidates, key=lambda state: (
@@ -108,6 +108,17 @@ def render_frame(cover, player, scroll_seconds=0, now=None, page_interval=8):
     return frame
 
 
+def render_paused_frame():
+    frame = Image.new("RGB", (64, 64), "black")
+    draw = ImageDraw.Draw(frame)
+    font = ImageFont.load_default(size=13)
+    for text, top in (("music", 19), ("paused", 35)):
+        width = math.ceil(draw.textlength(text, font=font))
+        draw.text(((64 - width) // 2, top - font.getbbox(text)[1]),
+                  text, font=font, fill="white")
+    return frame
+
+
 def pixel_chunks(image_bytes):
     image = image_bytes if isinstance(image_bytes, Image.Image) else load_cover(image_bytes)
     colors = ["%02x%02x%02x" % pixel for pixel in image.convert("RGB").getdata()]
@@ -130,6 +141,8 @@ class ArtworkBridge:
         self.last_health_check = 0
         self.owns_display = False
         self.current_player = None
+        self.playback_active = False
+        self.pause_until = None
         self.cover = None
         self.cover_url = None
         self.last_chunks = None
@@ -180,8 +193,11 @@ class ArtworkBridge:
                 render_frame, self.cover, player, time.monotonic() - self.scroll_started,
                 page_interval=self.options.get("page_interval", 8),
             )
-        chunks = await asyncio.to_thread(pixel_chunks, frame)
         full_update = self.last_chunks is None or picture != self.last_artwork
+        await self.display_frame(frame, full_update)
+
+    async def display_frame(self, frame, full_update):
+        chunks = await asyncio.to_thread(pixel_chunks, frame)
         async with asyncio.timeout(45):
             if full_update:
                 info = await self.get_json(self.display_url + "/json/info")
@@ -215,14 +231,34 @@ class ArtworkBridge:
         if poll:
             states = await self.get_json(self.ha_url + "/states", self.ha_headers)
             self.current_player = select_player(states, self.options.get("player_entities", []))
+            self.playback_active = select_player(
+                states, self.options.get("player_entities", []), require_picture=False
+            ) is not None
+        if self.playback_active and self.pause_until is not None:
+            self.pause_until = None
+            self.last_chunks = None
         player = self.current_player
         if player is None:
-            if self.options.get("idle_action", "keep") == "off" and self.owns_display:
-                await self.post_state({"on": False})
-                self.owns_display = False
+            if self.playback_active:
+                return
             self.last_artwork = None
-            self.last_chunks = None
             self.track_key = None
+            if self.options.get("pause_then_off", True):
+                if self.owns_display and self.pause_until is None:
+                    await self.display_frame(render_paused_frame(), full_update=True)
+                    self.pause_until = time.monotonic() + 60
+                    LOGGER.info("Music paused; turning off WLED in 60 seconds")
+                elif self.owns_display and time.monotonic() >= self.pause_until:
+                    await self.post_state({"on": False})
+                    self.owns_display = False
+                    self.pause_until = None
+                    self.last_chunks = None
+                    LOGGER.info("Turned off WLED after music paused")
+            else:
+                if self.options.get("idle_action", "keep") == "off" and self.owns_display:
+                    await self.post_state({"on": False})
+                    self.owns_display = False
+                self.last_chunks = None
             return
         picture = player["attributes"]["entity_picture"]
         attributes = player["attributes"]
@@ -250,7 +286,9 @@ class ArtworkBridge:
         next_poll = 0
         while not self.stopping.is_set():
             try:
-                poll = time.monotonic() >= next_poll
+                poll = (time.monotonic() >= next_poll
+                        or (self.pause_until is not None
+                            and time.monotonic() >= self.pause_until))
                 await self.update(poll=poll)
                 if poll:
                     next_poll = time.monotonic() + self.options.get("refresh_interval", 5)
@@ -263,7 +301,8 @@ class ArtworkBridge:
                 LOGGER.debug("Failure details", exc_info=True)
             try:
                 await asyncio.wait_for(self.stopping.wait(),
-                                       timeout=1 if self.options.get("show_track_info", True)
+                                       timeout=1 if (self.options.get("show_track_info", True)
+                                                     or self.pause_until is not None)
                                        else self.options.get("refresh_interval", 5))
             except TimeoutError:
                 pass

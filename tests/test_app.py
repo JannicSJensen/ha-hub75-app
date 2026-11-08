@@ -41,6 +41,7 @@ class ManifestTests(unittest.TestCase):
         self.assertTrue(config["homeassistant_api"])
         self.assertTrue(config["init"])
         self.assertTrue(config["options"]["show_track_info"])
+        self.assertTrue(config["options"]["pause_then_off"])
         self.assertEqual(config["options"]["page_interval"], 8)
         self.assertNotIn("image", config)
         self.assertRegex(config["version"], r"^\d+\.\d+\.\d+$")
@@ -167,6 +168,15 @@ class TrackInfoTests(unittest.TestCase):
                             second.crop((0, 22, 64, 36)).tobytes())
 
 
+    def test_pause_message_fits_on_two_centered_lines(self):
+        frame = APP.render_paused_frame()
+        self.assertEqual(frame.size, (64, 64))
+        self.assertIsNone(frame.crop((0, 0, 64, 19)).getbbox())
+        self.assertIsNotNone(frame.crop((0, 19, 64, 34)).getbbox())
+        self.assertIsNotNone(frame.crop((0, 35, 64, 50)).getbbox())
+        self.assertIsNone(frame.crop((0, 50, 64, 64)).getbbox())
+
+
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.states = [player()]
@@ -193,6 +203,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.bridge = APP.ArtworkBridge(self.session, {
             "display_url": self.base, "player_entities": [], "idle_action": "keep",
             "show_track_info": False,
+            "pause_then_off": False,
         }, "supervisor-token", self.base + "/core/api")
 
     async def asyncTearDown(self):
@@ -329,6 +340,104 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.bridge.update(poll=False)
         self.assertEqual(self.bridge.last_chunks, cover_chunks)
         self.assertEqual(len(self.auth), 1)
+
+    async def test_pause_screen_stays_for_one_minute_then_switches_off_once(self):
+        self.bridge.options["pause_then_off"] = True
+        await self.bridge.update()
+        self.states[0]["state"] = "paused"
+        self.posts.clear()
+        await self.bridge.update()
+        self.assertEqual(self.bridge.last_chunks, APP.pixel_chunks(APP.render_paused_frame()))
+        self.assertEqual(len(self.posts), 17)
+        deadline = self.bridge.pause_until
+        self.posts.clear()
+        await self.bridge.update(poll=False)
+        self.assertEqual(self.posts, [])
+        self.assertEqual(self.bridge.pause_until, deadline)
+        self.bridge.pause_until -= 61
+        await self.bridge.update()
+        self.assertEqual(self.posts, [{"on": False}])
+        await self.bridge.update()
+        self.assertEqual(self.posts, [{"on": False}])
+
+    async def test_resume_cancels_shutdown_and_restores_cached_cover(self):
+        self.bridge.options["pause_then_off"] = True
+        await self.bridge.update()
+        self.states[0]["state"] = "idle"
+        await self.bridge.update()
+        self.assertIsNotNone(self.bridge.pause_until)
+        self.states[0]["state"] = "playing"
+        self.posts.clear()
+        await self.bridge.update()
+        self.assertIsNone(self.bridge.pause_until)
+        self.assertTrue(self.posts[0]["on"])
+        self.assertEqual(self.bridge.last_chunks, APP.pixel_chunks(APP.load_cover(self.art)))
+        self.assertEqual(len(self.auth), 1)
+
+    async def test_resume_after_shutdown_turns_display_on(self):
+        self.bridge.options["pause_then_off"] = True
+        await self.bridge.update()
+        self.states[0]["state"] = "idle"
+        await self.bridge.update()
+        self.bridge.pause_until -= 61
+        await self.bridge.update()
+        self.assertFalse(self.bridge.owns_display)
+        self.states[0]["state"] = "playing"
+        self.posts.clear()
+        await self.bridge.update()
+        self.assertTrue(self.posts[0]["on"])
+        self.assertTrue(self.bridge.owns_display)
+
+    async def test_other_playing_player_does_not_trigger_pause(self):
+        self.bridge.options["pause_then_off"] = True
+        await self.bridge.update()
+        self.states[0]["state"] = "idle"
+        self.states.append(player("media_player.bedroom"))
+        await self.bridge.update()
+        self.assertIsNone(self.bridge.pause_until)
+
+    async def test_playing_without_artwork_does_not_trigger_pause(self):
+        self.bridge.options["pause_then_off"] = True
+        await self.bridge.update()
+        self.states[0]["attributes"]["entity_picture"] = None
+        self.posts.clear()
+        await self.bridge.update()
+        self.assertEqual(self.posts, [])
+        self.assertIsNone(self.bridge.pause_until)
+
+    async def test_starting_idle_does_not_take_over_display(self):
+        self.bridge.options["pause_then_off"] = True
+        self.states = []
+        await self.bridge.update()
+        self.assertEqual(self.posts, [])
+
+    async def test_failed_pause_upload_is_retried_before_timer_starts(self):
+        self.bridge.options["pause_then_off"] = True
+        await self.bridge.update()
+        self.states = []
+        self.reject_pixels = True
+        with self.assertRaises(RuntimeError):
+            await self.bridge.update()
+        self.assertIsNone(self.bridge.pause_until)
+        self.reject_pixels = False
+        await self.bridge.update()
+        self.assertIsNotNone(self.bridge.pause_until)
+
+    async def test_failed_shutdown_retries_without_restarting_pause_minute(self):
+        self.bridge.options["pause_then_off"] = True
+        await self.bridge.update()
+        self.states = []
+        await self.bridge.update()
+        self.bridge.pause_until -= 61
+        deadline = self.bridge.pause_until
+        with patch.object(self.bridge, "post_state", side_effect=RuntimeError("offline")):
+            with self.assertRaises(RuntimeError):
+                await self.bridge.update()
+        self.assertTrue(self.bridge.owns_display)
+        self.assertEqual(self.bridge.pause_until, deadline)
+        await self.bridge.update()
+        self.assertFalse(self.bridge.owns_display)
+        self.assertIsNone(self.bridge.pause_until)
 
 
 if __name__ == "__main__":

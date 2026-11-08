@@ -53,6 +53,18 @@ up the new artwork.
 
 ## Permissions and Limitations
 
+When no selected Music Assistant player is playing, a display previously taken
+over by the app enters the pause state by default. A shared frame uploader writes
+"music paused" and starts a monotonic 60-second deadline only after a successful
+upload. Idle rendering checks the deadline at one-second intervals; HA is polled
+again before shutdown to avoid switching off after playback has resumed. The
+deadline is cleared after shutdown, returning to normal HA polling.
+
+Playing resumes cancel the deadline and invalidate the old frame so the cover
+is redrawn and WLED is turned on. Temporary artwork loss does not count as a
+playback stop. The timer is in memory; app startup while idle does not take over
+the display. `pause_then_off: false` preserves the legacy `idle_action` modes.
+
 `homeassistant_api: true` grants HA administrator access through the Supervisor
 proxy. The app only reads states and artwork, but the supplied credential must
 still be treated as an administrator secret. It is never sent to WLED or to
@@ -74,5 +86,6 @@ player selection, pixel ordering, padding, transparency, token isolation,
 unchanged-artwork caching, restart recovery, idle behavior, rejected uploads,
 incorrect matrix dimensions, oversized downloads, countdown extrapolation,
 metadata layout, scrolling, page boundaries, configurable flip intervals,
-new-song page resets, and incremental frame uploads. HTTP integration tests
+new-song page resets, incremental frame uploads, the one-minute pause screen,
+resume cancellation, shutdown retries, and idle startup. HTTP integration tests
 use in-process aiohttp servers without HA credentials or real hardware.
