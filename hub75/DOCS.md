@@ -1,3 +1,15 @@
+# Screen Previews
+
+The [screen gallery](https://github.com/JannicSJensen/ha-hub75-app#screens)
+shows the cover, three artist-image pages, track information, equalizer, and
+pause screen. These are actual renderer outputs with example artwork and
+illustrative spectrum data, enlarged from 64x64 without smoothing; they are
+not photographs of a physical display.
+
+| Track information | Paused before shutdown |
+| --- | --- |
+| ![Countdown, title, artist, and album](https://raw.githubusercontent.com/JannicSJensen/ha-hub75-app/main/docs/screenshots/track-info.png) | ![Music paused for one minute before WLED switches off](https://raw.githubusercontent.com/JannicSJensen/ha-hub75-app/main/docs/screenshots/paused.png) |
+
 # Configuration
 
 ```yaml

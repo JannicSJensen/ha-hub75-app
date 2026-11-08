@@ -1,5 +1,5 @@
 name: HUB75 Album Artwork
-version: "0.8.0"
+version: "0.8.1"
 slug: hub75_album_art
 description: Display Music Assistant album artwork on a WLED HUB75 matrix
 url: https://github.com/JannicSJensen/ha-hub75-app

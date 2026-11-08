@@ -1,5 +1,19 @@
 # HUB75 Album Artwork
 
+## Screen Previews
+
+Software previews from the actual 64x64 renderer, enlarged without smoothing;
+not photographs of the panel. Artwork and track details are examples.
+
+| Album cover | Track information | Equalizer |
+| --- | --- | --- |
+| ![Sample album cover](https://raw.githubusercontent.com/JannicSJensen/ha-hub75-app/main/docs/screenshots/album-cover.png) | ![Countdown and scrolling track details](https://raw.githubusercontent.com/JannicSJensen/ha-hub75-app/main/docs/screenshots/track-info.png) | ![Sixteen spectrum bars](https://raw.githubusercontent.com/JannicSJensen/ha-hub75-app/main/docs/screenshots/equalizer.png) |
+
+See the [complete screen gallery](https://github.com/JannicSJensen/ha-hub75-app#screens)
+for artist images, the pause screen, an equalizer animation, and image credits.
+
+## Overview
+
 Display Music Assistant album covers on a WLED 64x64 HUB75 matrix. The app
 automatically follows playing Music Assistant media players and preserves the
 display's current brightness. A full-screen cover alternates with a separate

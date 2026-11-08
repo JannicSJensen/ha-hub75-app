@@ -6,6 +6,32 @@ running WLED. No Dasher dependency, HA YAML automation, or manually created
 Home Assistant token is required. Core playback pages need no Music Assistant
 API token; optional artist photos use separate MA URL/token settings.
 
+## Screens
+
+Actual app-rendered 64x64 frames, enlarged four times without smoothing. These
+are software previews, not photographs of a physical LED panel. The example
+uses a designed sample album cover and public-domain Beethoven portraits;
+your Music Assistant artwork replaces them during playback.
+
+| Album cover | Artist image 1 |
+| --- | --- |
+| ![Full-screen sample album cover](docs/screenshots/album-cover.png) | ![First full-screen artist portrait](docs/screenshots/artist-1.png) |
+| **Artist image 2** | **Artist image 3** |
+| ![Second full-screen artist portrait](docs/screenshots/artist-2.png) | ![Third full-screen artist portrait](docs/screenshots/artist-3.png) |
+| **Track information** | **Equalizer** |
+| ![Countdown, song title, artist, and album](docs/screenshots/track-info.png) | ![Sixteen colored spectrum bars](docs/screenshots/equalizer.png) |
+| **Music paused** | **Equalizer animation** |
+| ![Music paused screen shown before shutdown](docs/screenshots/paused.png) | ![Animated equalizer using illustrative spectrum data](docs/screenshots/equalizer-animated.gif) |
+
+Playback order is cover, available artist images, track information, then
+equalizer. Artist images and the equalizer are optional. Long text scrolls;
+the information preview captures the start of a scrolling row. The pause screen
+appears for one minute before WLED turns off. The equalizer animation uses
+illustrative spectrum values, not captured audio.
+
+See [image sources and regeneration](docs/screenshots/README.md) for credits
+and instructions for updating these previews.
+
 ## Requirements
 
 - Home Assistant OS with Supervisor and the Music Assistant integration enabled.
@@ -110,4 +136,4 @@ docker build -t ha-hub75-app:dev hub75
 The tests validate the HA manifest and run against mock HTTP servers and a local
 UDP receiver, with no HA
 credentials or physical display required. CI tests Python 3.13 and builds both
-CPU architectures. The configured app version is `0.8.0`.
+CPU architectures. The configured app version is `0.8.1`.

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.1
+
+- Add a GitHub documentation gallery covering album artwork, three artist images, track information, equalizer, and the pause screen.
+- Include an animated equalizer example and previews in the HA app README and documentation.
+- Generate previews with the actual screen renderer; document sample data, public-domain image sources, and regeneration steps.
+- No changes to playback or display behavior.
+
 ## 0.8.0
 
 - Add optional artist-photo pages between the album cover and track-information page.
