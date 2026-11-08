@@ -43,11 +43,15 @@ share one display, so the most recent player takes precedence. If it stops,
 another playing player takes over. Artwork changes cause a new upload; position
 and volume updates do not.
 
-The default layout shows a 28x28 cover above three text lines (title, artist,
-album) and a remaining-time countdown. Long text scrolls horizontally. The
-countdown advances every second using HA's playback position timestamp between
-HA polls; live streams without a duration show `--:--`. Set `show_track_info`
-to `false` to restore the original full-cover 64x64 layout.
+The display alternates between two pages: a full-screen 64x64 album cover and
+a track-information page with a large countdown, song title, artist, and album.
+Each page stays visible for eight seconds by default; change `page_interval`
+to adjust that duration. New songs start on the cover page. Long text scrolls
+horizontally and continues across later information pages.
+
+The countdown advances every second on the information page using HA's playback
+position timestamp between HA polls; live streams without a duration show
+`--:--`. Set `show_track_info` to `false` to show only the full-screen cover.
 
 Initial frames are sent as 16 sequential pixel requests. Subsequent text and
 countdown frames send only changed chunks without downloading the cover again.
@@ -71,4 +75,4 @@ docker build -t ha-hub75-app:dev hub75
 
 The tests validate the HA manifest and run against mock HTTP servers, with no HA
 credentials or physical display required. CI tests Python 3.13 and builds both
-CPU architectures. The configured app version is `0.2.0`.
+CPU architectures. The configured app version is `0.3.0`.

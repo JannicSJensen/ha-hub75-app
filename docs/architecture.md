@@ -15,8 +15,8 @@ by Supervisor in `/data/options.json`.
    proxy; absolute HTTP/HTTPS pictures are fetched without the Supervisor token.
 5. Use Pillow to apply EXIF orientation, preserve aspect ratio, pad to 64x64,
    and composite transparency onto black. Cache the decoded cover. With
-   `show_track_info`, compose a 28x28 cover and four nine-pixel text rows for
-   title, artist, album, and remaining time.
+   `show_track_info`, alternate the full 64x64 cover with a separate information
+   page. Use a large countdown above three fourteen-pixel metadata rows.
 6. Verify WLED reports a 64x64 matrix. Turn it on and configure segment 0 in a
    separate request before writing pixels, preserving its existing brightness.
 7. Upload 16 sequential 256-pixel JSON requests to WLED `/json/state` for an
@@ -33,7 +33,10 @@ memory. Unchanged artwork is not downloaded again. With track information
 enabled, a one-second render loop interpolates elapsed playback from HA's
 position timestamp, updates the countdown, and scrolls long text. HA state
 polling retains its independently configured interval. A track/player/metadata
-change resets the scroll position even when the cover URL is unchanged.
+change resets the page cycle and scroll position even when the cover URL is
+unchanged. Each page is visible for `page_interval` seconds; the cover comes
+first. Metadata scrolling counts time spent on information pages, continuing
+across later cycles instead of repeatedly showing only the beginning of a line.
 
 Full-cover mode skips unchanged frames entirely. Every 30 seconds, the app checks that WLED is
 on and segment 0 is on and frozen. An unhealthy state triggers another upload.
@@ -70,5 +73,6 @@ cannot be distinguished from this app's own image.
 player selection, pixel ordering, padding, transparency, token isolation,
 unchanged-artwork caching, restart recovery, idle behavior, rejected uploads,
 incorrect matrix dimensions, oversized downloads, countdown extrapolation,
-metadata layout, scrolling, and incremental frame uploads. HTTP integration tests
+metadata layout, scrolling, page boundaries, configurable flip intervals,
+new-song page resets, and incremental frame uploads. HTTP integration tests
 use in-process aiohttp servers without HA credentials or real hardware.

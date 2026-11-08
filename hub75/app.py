@@ -69,20 +69,32 @@ def remaining_time(player, now=None):
     return f"-{minutes}:{seconds:02}"
 
 
-def render_frame(cover, player, scroll_seconds=0, now=None):
+def render_frame(cover, player, scroll_seconds=0, now=None, page_interval=8):
+    page_seconds = max(0, scroll_seconds) % (2 * page_interval)
+    if page_seconds < page_interval:
+        return cover.copy()
+    completed_cycles = max(0, scroll_seconds) // (2 * page_interval)
+    scroll_seconds = completed_cycles * page_interval + page_seconds - page_interval
     frame = Image.new("RGB", (64, 64), "black")
-    frame.paste(cover.resize((28, 28), Image.Resampling.LANCZOS), (18, 0))
-    font = ImageFont.load_default(size=8)
+    font = ImageFont.load_default(size=11)
     attributes = player.get("attributes", {})
+    timer = remaining_time(player, now)
+    timer_font = ImageFont.load_default(size=18)
+    draw = ImageDraw.Draw(frame)
+    while draw.textlength(timer, font=timer_font) > 64:
+        timer_font = ImageFont.load_default(size=timer_font.size - 1)
+    timer_width = math.ceil(draw.textlength(timer, font=timer_font))
+    timer_top = timer_font.getbbox(timer)[1]
+    draw.text(((64 - timer_width) // 2, -timer_top), timer,
+              font=timer_font, fill="#93e9ac")
     lines = (
         (attributes.get("media_title") or "", "white"),
         (attributes.get("media_artist") or "", "#73dce8"),
         (attributes.get("media_album_name") or "", "#efc871"),
-        (remaining_time(player, now), "#93e9ac"),
     )
     for index, (text, color) in enumerate(lines):
         text = " ".join(str(text).split())[:512]
-        row = Image.new("RGB", (64, 9), "black")
+        row = Image.new("RGB", (64, 14), "black")
         draw = ImageDraw.Draw(row)
         width = math.ceil(draw.textlength(text, font=font))
         top = font.getbbox(text)[1] if text else 0
@@ -92,7 +104,7 @@ def render_frame(cover, player, scroll_seconds=0, now=None):
             draw.text((width + 16 - offset, -top), text, font=font, fill=color)
         else:
             draw.text(((64 - width) // 2, -top), text, font=font, fill=color)
-        frame.paste(row, (0, 28 + index * 9))
+        frame.paste(row, (0, 22 + index * 14))
     return frame
 
 
@@ -165,7 +177,8 @@ class ArtworkBridge:
         frame = self.cover
         if player is not None and self.options.get("show_track_info", True):
             frame = await asyncio.to_thread(
-                render_frame, self.cover, player, time.monotonic() - self.scroll_started
+                render_frame, self.cover, player, time.monotonic() - self.scroll_started,
+                page_interval=self.options.get("page_interval", 8),
             )
         chunks = await asyncio.to_thread(pixel_chunks, frame)
         full_update = self.last_chunks is None or picture != self.last_artwork

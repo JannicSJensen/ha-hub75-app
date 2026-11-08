@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0
+
+- Alternate between a full-screen album cover and a separate track-information page.
+- Enlarge the live countdown, song title, artist, and album on the information page.
+- Add `page_interval` to configure each page's duration, defaulting to eight seconds.
+- Start new songs on the cover page and continue long-text scrolling across later pages.
+- Reuse cached artwork during page flips and preserve cover-only mode.
+
 ## 0.2.0
 
 - Display the song title, artist, and album beneath a compact album cover.

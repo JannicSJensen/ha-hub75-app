@@ -41,6 +41,7 @@ class ManifestTests(unittest.TestCase):
         self.assertTrue(config["homeassistant_api"])
         self.assertTrue(config["init"])
         self.assertTrue(config["options"]["show_track_info"])
+        self.assertEqual(config["options"]["page_interval"], 8)
         self.assertNotIn("image", config)
         self.assertRegex(config["version"], r"^\d+\.\d+\.\d+$")
         changelog = (root / "hub75" / "CHANGELOG.md").read_text()
@@ -113,29 +114,57 @@ class TrackInfoTests(unittest.TestCase):
         selected["attributes"].update(media_duration=3661, media_position=0)
         self.assertEqual(APP.remaining_time(selected), "-1:01:01")
 
-    def test_all_four_text_rows_and_cover_fit_panel(self):
+    def test_cover_and_information_pages_flip_on_interval_boundaries(self):
+        selected = player()
+        cover = Image.new("RGB", (64, 64), "red")
+        for seconds in (0, 7.99, 16, 23.99):
+            self.assertEqual(APP.render_frame(cover, selected, seconds).tobytes(),
+                             cover.tobytes())
+        for seconds in (8, 15.99, 24):
+            self.assertNotEqual(APP.render_frame(cover, selected, seconds).tobytes(),
+                                cover.tobytes())
+        self.assertNotEqual(APP.render_frame(cover, selected, 3, page_interval=3).tobytes(),
+                            cover.tobytes())
+        self.assertEqual(APP.render_frame(cover, selected, 6, page_interval=3).tobytes(),
+                         cover.tobytes())
+
+    def test_all_four_information_rows_fit_panel(self):
         selected = player()
         selected["attributes"].update(media_title="Paradise", media_artist="Coldplay",
                                       media_album_name="Mylo Xyloto", media_duration=240)
-        frame = APP.render_frame(Image.new("RGB", (64, 64), "red"), selected)
+        frame = APP.render_frame(Image.new("RGB", (64, 64), "red"), selected, 8)
         self.assertEqual(frame.size, (64, 64))
-        self.assertEqual(frame.getpixel((18, 0)), (255, 0, 0))
-        for top in (28, 37, 46, 55):
-            self.assertIsNotNone(frame.crop((0, top, 64, top + 9)).getbbox())
+        self.assertIsNotNone(frame.crop((0, 0, 64, 20)).getbbox())
+        for top in (22, 36, 50):
+            self.assertIsNotNone(frame.crop((0, top, 64, top + 14)).getbbox())
 
-    def test_long_text_scrolls_without_touching_cover_or_timer(self):
+    def test_long_text_scrolls_without_touching_timer(self):
         selected = player()
         selected["attributes"].update(media_title="A very long song title beyond the panel",
                                       media_artist="Artist", media_album_name="Album")
         cover = Image.new("RGB", (64, 64), "red")
-        first = APP.render_frame(cover, selected, 0)
-        later = APP.render_frame(cover, selected, 5)
-        self.assertNotEqual(first.crop((0, 28, 64, 37)).tobytes(),
-                            later.crop((0, 28, 64, 37)).tobytes())
-        self.assertEqual(first.crop((0, 0, 64, 28)).tobytes(),
-                         later.crop((0, 0, 64, 28)).tobytes())
-        self.assertEqual(first.crop((0, 55, 64, 64)).tobytes(),
-                         later.crop((0, 55, 64, 64)).tobytes())
+        first = APP.render_frame(cover, selected, 8)
+        later = APP.render_frame(cover, selected, 13)
+        self.assertNotEqual(first.crop((0, 22, 64, 36)).tobytes(),
+                            later.crop((0, 22, 64, 36)).tobytes())
+        self.assertEqual(first.crop((0, 0, 64, 20)).tobytes(),
+                         later.crop((0, 0, 64, 20)).tobytes())
+
+    def test_hour_countdown_fits_without_entering_text_rows(self):
+        selected = player()
+        selected["attributes"].update(media_duration=3661)
+        frame = APP.render_frame(Image.new("RGB", (64, 64), "red"), selected, 8)
+        self.assertIsNotNone(frame.crop((0, 0, 64, 20)).getbbox())
+        self.assertIsNone(frame.crop((0, 20, 64, 22)).getbbox())
+
+    def test_long_text_continues_scrolling_on_later_information_pages(self):
+        selected = player()
+        selected["attributes"]["media_title"] = "A very long song title beyond the panel"
+        cover = Image.new("RGB", (64, 64), "red")
+        first = APP.render_frame(cover, selected, 8)
+        second = APP.render_frame(cover, selected, 24)
+        self.assertNotEqual(first.crop((0, 22, 64, 36)).tobytes(),
+                            second.crop((0, 22, 64, 36)).tobytes())
 
 
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
@@ -261,22 +290,44 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(APP, "remaining_time", return_value="-3:00"):
             await self.bridge.update()
         self.assertEqual(len(self.posts), 17)
+        self.bridge.scroll_started -= 8
+        with patch.object(APP, "remaining_time", return_value="-3:00"):
+            await self.bridge.update(poll=False)
         self.posts.clear()
         with patch.object(APP, "remaining_time", return_value="-2:59"):
             await self.bridge.update(poll=False)
         self.assertGreater(len(self.posts), 0)
         self.assertLess(len(self.posts), 16)
-        self.assertTrue(all(payload["seg"][0]["i"][0] >= 3328 for payload in self.posts))
+        self.assertTrue(all(payload["seg"][0]["i"][0] < 1280 for payload in self.posts))
         self.assertEqual(len(self.auth), 1)
 
     async def test_new_song_on_same_album_updates_metadata_without_redownload(self):
         self.bridge.options["show_track_info"] = True
         self.states[0]["attributes"]["media_title"] = "First song"
         await self.bridge.update()
+        self.bridge.scroll_started -= 8
+        await self.bridge.update(poll=False)
         self.posts.clear()
         self.states[0]["attributes"]["media_title"] = "Second song"
         await self.bridge.update()
         self.assertGreater(len(self.posts), 0)
+        self.assertEqual(len(self.auth), 1)
+        self.assertEqual(self.bridge.last_chunks,
+                         APP.pixel_chunks(APP.load_cover(self.art)))
+
+    async def test_page_flips_do_not_redownload_cover(self):
+        self.bridge.options["show_track_info"] = True
+        await self.bridge.update()
+        cover_chunks = self.bridge.last_chunks
+        self.posts.clear()
+        await self.bridge.update(poll=False)
+        self.assertEqual(self.posts, [])
+        self.bridge.scroll_started -= 8
+        await self.bridge.update(poll=False)
+        self.assertNotEqual(self.bridge.last_chunks, cover_chunks)
+        self.bridge.scroll_started -= 8
+        await self.bridge.update(poll=False)
+        self.assertEqual(self.bridge.last_chunks, cover_chunks)
         self.assertEqual(len(self.auth), 1)
 
 
