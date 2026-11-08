@@ -1,0 +1,2 @@
+-r hub75/requirements.txt
+PyYAML>=6.0.3,<7
