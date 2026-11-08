@@ -10,11 +10,12 @@ import signal
 import socket
 import struct
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from contextlib import suppress
 from ipaddress import IPv4Address
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -88,6 +89,29 @@ def decode_audio_sync(packet):
     return tuple(spectrum)
 
 
+def artist_image_sources(artist, base_url):
+    images = [artist.get("image"), *artist.get("metadata", {}).get("images", [])]
+    sources = []
+    for image in images:
+        if not isinstance(image, dict) or image.get("type") not in ("thumb", "fanart", "landscape"):
+            continue
+        path = image.get("path")
+        if not path:
+            continue
+        if image.get("remotely_accessible") and urlsplit(path).scheme in ("http", "https"):
+            source = (path, False)
+        elif image.get("proxy_id"):
+            source = (base_url + "/imageproxy/" + quote(str(image["proxy_id"]), safe="")
+                      + "?size=64", True)
+        else:
+            query = urlencode({"path": quote(path, safe=""),
+                               "provider": image.get("provider", ""), "size": 64})
+            source = (base_url + "/imageproxy?" + query, True)
+        if source not in sources:
+            sources.append(source)
+    return sources[:12]
+
+
 def render_equalizer(spectrum):
     if len(spectrum) != 16:
         raise ValueError("Equalizer requires 16 spectrum bands")
@@ -103,12 +127,15 @@ def render_equalizer(spectrum):
 
 
 def render_frame(cover, player, scroll_seconds=0, now=None, page_interval=8,
-                 equalizer=None, show_track_info=True):
+                 equalizer=None, show_track_info=True, artist_images=()):
     elapsed = max(0, scroll_seconds)
-    page_count = 1 + bool(show_track_info) + (equalizer is not None)
+    artist_images = artist_images[:3]
+    page_count = 1 + len(artist_images) + bool(show_track_info) + (equalizer is not None)
     page_index = int(elapsed // page_interval) % page_count
     if page_index == 0:
         return cover.copy()
+    if page_index <= len(artist_images):
+        return artist_images[page_index - 1].copy()
     if equalizer is not None and page_index == page_count - 1:
         return render_equalizer(equalizer)
     completed_cycles = elapsed // (page_count * page_interval)
@@ -272,6 +299,19 @@ class ArtworkBridge:
         self.track_key = None
         self.scroll_started = time.monotonic()
         self.stopping = asyncio.Event()
+        self.ma_url = options.get("music_assistant_url", "").rstrip("/")
+        self.ma_token = options.get("music_assistant_token", "")
+        self.artist_image_count = int(options.get("artist_image_count", 3))
+        if not 1 <= self.artist_image_count <= 3:
+            raise ValueError("artist_image_count must be between 1 and 3")
+        self.artist_enabled = options.get("show_artist_images", False)
+        if self.artist_enabled and self.ma_url:
+            if urlsplit(self.ma_url).scheme not in ("http", "https") or not urlsplit(self.ma_url).hostname:
+                raise ValueError("music_assistant_url must be an HTTP or HTTPS server URL")
+        self.artist_key = ""
+        self.artist_images = ()
+        self.artist_cache = OrderedDict()
+        self.artist_task = None
 
     async def get_json(self, url, headers=None):
         async with self.session.get(url, headers=headers) as response:
@@ -296,6 +336,9 @@ class ArtworkBridge:
             headers = None
         else:
             raise ValueError("Unsupported artwork URL")
+        return await self.fetch_image(url, headers)
+
+    async def fetch_image(self, url, headers=None):
         image_bytes = bytearray()
         async with self.session.get(url, headers=headers) as response:
             response.raise_for_status()
@@ -305,19 +348,93 @@ class ArtworkBridge:
                     raise ValueError("Artwork exceeds 10 MiB")
         return bytes(image_bytes)
 
+    async def ma_command(self, command, args):
+        headers = {"Authorization": f"Bearer {self.ma_token}"}
+        async with self.session.post(self.ma_url + "/api", headers=headers,
+                                     json={"message_id": "artist", "command": command,
+                                           "args": args}) as response:
+            response.raise_for_status()
+            result = await response.json()
+        if isinstance(result, dict) and (result.get("error") or result.get("error_code")):
+            raise RuntimeError("Music Assistant rejected the artist lookup")
+        return result.get("result", result) if isinstance(result, dict) else result
+
+    async def load_artist_images(self, name, key):
+        images = []
+        try:
+            async with asyncio.timeout(45):
+                artists = await self.ma_command("music/artists/library_items",
+                                                {"search": name, "limit": 25})
+                matches = [artist for artist in artists if isinstance(artist, dict)
+                           and " ".join(str(artist.get("name", "")).split()).casefold() == key]
+                if len(matches) == 1:
+                    artist = matches[0]
+                    artist = await self.ma_command("music/artists/get", {
+                        "item_id": str(artist["item_id"]),
+                        "provider_instance_id_or_domain": artist.get("provider", "library"),
+                    })
+                    for url, authenticated in artist_image_sources(artist, self.ma_url):
+                        try:
+                            headers = ({"Authorization": f"Bearer {self.ma_token}"}
+                                       if authenticated else None)
+                            data = await self.fetch_image(url, headers)
+                            image = await asyncio.to_thread(load_cover, data)
+                            if all(image.tobytes() != previous.tobytes() for previous in images):
+                                images.append(image)
+                            if len(images) >= self.artist_image_count:
+                                break
+                        except (aiohttp.ClientError, OSError, ValueError,
+                                Image.DecompressionBombError):
+                            continue
+        except (aiohttp.ClientError, TimeoutError, OSError, ValueError, RuntimeError,
+                TypeError, KeyError) as error:
+            LOGGER.warning("Artist artwork unavailable (%s); keeping other pages", type(error).__name__)
+        self.artist_cache[key] = (time.monotonic() + (3600 if images else 300), tuple(images))
+        self.artist_cache.move_to_end(key)
+        while len(self.artist_cache) > 32:
+            self.artist_cache.popitem(last=False)
+        if key == self.artist_key:
+            self.artist_images = tuple(images)
+            if images:
+                self.scroll_started = time.monotonic()
+                LOGGER.info("Loaded %s artist photo pages", len(images))
+
+    async def update_artist_images(self, player):
+        name = " ".join(str(player.get("attributes", {}).get("media_artist") or "").split())
+        key = name.casefold()
+        if key != self.artist_key:
+            if self.artist_task is not None:
+                self.artist_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self.artist_task
+                self.artist_task = None
+            self.artist_key = key
+            self.artist_images = ()
+        if not (self.artist_enabled and self.ma_url and self.ma_token and key):
+            return
+        cached = self.artist_cache.get(key)
+        if cached is not None and cached[0] > time.monotonic():
+            self.artist_cache.move_to_end(key)
+            self.artist_images = cached[1]
+        elif self.artist_task is None or self.artist_task.done():
+            self.artist_task = asyncio.create_task(self.load_artist_images(name, key))
+
     async def display_artwork(self, picture, player=None):
         if picture != self.cover_url:
             image_bytes = await self.fetch_artwork(picture)
             self.cover = await asyncio.to_thread(load_cover, image_bytes)
             self.cover_url = picture
         frame = self.cover
+        if player is not None:
+            await self.update_artist_images(player)
         if player is not None and (self.options.get("show_track_info", True)
-                                   or self.audio_sync is not None):
+                                   or self.audio_sync is not None or self.artist_images):
             frame = await asyncio.to_thread(
                 render_frame, self.cover, player, time.monotonic() - self.scroll_started,
                 page_interval=self.options.get("page_interval", 8),
                 equalizer=self.audio_sync.spectrum() if self.audio_sync is not None else None,
                 show_track_info=self.options.get("show_track_info", True),
+                artist_images=self.artist_images,
             )
         missing_frame = (self.last_ddp_frame is None if self.output_protocol == "ddp"
                          else self.last_chunks is None)
@@ -401,6 +518,11 @@ class ArtworkBridge:
         self.ddp_active = False
 
     async def close(self):
+        if self.artist_task is not None:
+            self.artist_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.artist_task
+            self.artist_task = None
         if self.audio_sync is not None:
             self.audio_sync.close()
         await self.stop_ddp()
@@ -472,6 +594,7 @@ class ArtworkBridge:
             if self.playback_active:
                 await self.keep_ddp_alive()
                 return
+            await self.update_artist_images({})
             self.last_artwork = None
             self.track_key = None
             if self.options.get("pause_then_off", True):
@@ -512,7 +635,8 @@ class ArtworkBridge:
                 if not healthy:
                     self.last_chunks = None
                     self.last_ddp_frame = None
-            cover_only = not self.options.get("show_track_info", True) and self.audio_sync is None
+            cover_only = (not self.options.get("show_track_info", True)
+                          and self.audio_sync is None and not self.artist_enabled)
             if healthy and cover_only:
                 if self.output_protocol == "http" or self.last_ddp_frame is not None:
                     await self.keep_ddp_alive()
@@ -528,13 +652,14 @@ class ArtworkBridge:
                 return 0.05
             return (0.1 if self.current_player is not None
                     and self.options.get("show_track_info", True) else 0.5)
-        if (self.options.get("show_track_info", True) or self.audio_sync is not None
-            or self.pause_until is not None):
+        if self.artist_enabled or self.options.get("show_track_info", True) or self.audio_sync is not None or self.pause_until is not None:
             return 1
         return self.options.get("refresh_interval", 5)
 
     async def run(self):
         try:
+            if self.artist_enabled and not (self.ma_url and self.ma_token):
+                LOGGER.warning("Artist pages need music_assistant_url and music_assistant_token; skipping photos")
             if self.audio_sync is not None:
                 await self.audio_sync.start()
             await self.run_updates()

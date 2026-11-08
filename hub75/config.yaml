@@ -1,5 +1,5 @@
 name: HUB75 Album Artwork
-version: "0.7.0"
+version: "0.8.0"
 slug: hub75_album_art
 description: Display Music Assistant album artwork on a WLED HUB75 matrix
 url: https://github.com/JannicSJensen/ha-hub75-app
@@ -18,6 +18,10 @@ options:
   idle_action: keep
   pause_then_off: true
   show_track_info: true
+  show_artist_images: false
+  artist_image_count: 3
+  music_assistant_url: ""
+  music_assistant_token: ""
   show_equalizer: false
   audio_sync_port: 11988
   audio_sync_interface: 0.0.0.0
@@ -33,6 +37,10 @@ schema:
   idle_action: list(keep|off)
   pause_then_off: bool
   show_track_info: bool
+  show_artist_images: bool
+  artist_image_count: int(1,3)
+  music_assistant_url: str
+  music_assistant_token: password?
   show_equalizer: bool
   audio_sync_port: port
   audio_sync_interface: str

@@ -7,6 +7,10 @@ player_entities: []
 idle_action: keep
 pause_then_off: true
 show_track_info: true
+show_artist_images: false
+artist_image_count: 3
+music_assistant_url: ""
+music_assistant_token: ""
 show_equalizer: false
 audio_sync_port: 11988
 audio_sync_interface: 0.0.0.0
@@ -23,11 +27,15 @@ log_level: info
 | `player_entities` | Optional list of Music Assistant HA media-player IDs. Empty means all MA players. |
 | `idle_action` | Used only when `pause_then_off` is `false`: `keep` leaves the last frame visible; `off` turns WLED off immediately. |
 | `pause_then_off` | Show "music paused" for 60 seconds after playback stops, then switch WLED off. Default: `true`. Overrides `idle_action`. |
-| `show_track_info` | Include the track-information page. Default: `true`. Disable this and `show_equalizer` for an uninterrupted cover. |
+| `show_track_info` | Include the track-information page. Default: `true`. Disable all optional pages for an uninterrupted cover. |
+| `show_artist_images` | Include up to three full-screen artist photos after the cover. Default: `false`. Requires MA URL/token settings. |
+| `artist_image_count` | Maximum number of distinct artist photos, from 1 to 3. Default: `3`. Missing photos are skipped, not repeated. |
+| `music_assistant_url` | Optional MA server base URL, for example `http://YOUR_MA_HOST:8095`. Use the direct server URL, not HA ingress or `/api`. |
+| `music_assistant_token` | Optional MA access token for artist-library reads, entered in the password field. Not a HA or Supervisor token. |
 | `show_equalizer` | Include a live 16-band spectrum page using Music Assistant's WLED Audio Sync data. Default: `false`. |
 | `audio_sync_port` | UDP zone port matching the Music Assistant WLED Audio Sync provider. Default: `11988`. Not DDP's port 4048. |
 | `audio_sync_interface` | HA host's local IPv4 address for joining the multicast group. `0.0.0.0` (default) selects the OS default interface. |
-| `page_interval` | Seconds each page remains visible, from 3 to 60. Default: 8. Ignored only when both optional pages are disabled. |
+| `page_interval` | Seconds each available page remains visible, from 3 to 60. Default: 8. Only the cover is shown when no optional pages are available. |
 | `rotation` | Dropdown for clockwise rotation: `0`, `45`, `90`, `135`, or `180` degrees. Default: `0`. Applies to every page. |
 | `refresh_interval` | Seconds between HA checks, from 1 to 60. Default: 5. |
 | `log_level` | `debug`, `info`, `warning`, or `error`. Default: `info`. |
@@ -76,6 +84,43 @@ Updating from 0.3.0 enables this behavior by default, even if `idle_action` was
 previously `keep`. Set `pause_then_off: false` and restart the app to retain the
 old `idle_action` behavior.
 
+## Artist Photos
+
+Enable `show_artist_images` to rotate through **album cover > artist photo 1 >
+artist photo 2 > artist photo 3 > track information > equalizer > album cover**.
+Only enabled and available pages are included. Set `artist_image_count: 2` for
+at most two photo pages, or `3` for at most three. If only one distinct photo is
+available, it appears once. Each page uses `page_interval` and the configured
+rotation. Photos preserve their aspect ratio with black padding like the cover.
+
+Create an access token in Music Assistant's Profile settings and enter it
+directly in this app's `music_assistant_token` password field. Give the token
+artist/library read access if your MA version supports scoped tokens. Set
+`music_assistant_url` to that server's reachable base URL, save, and restart.
+Do not put the token in a URL or share it in logs. Existing HA-based cover and
+track pages continue to work without these settings.
+
+The app looks for a unique case-insensitive exact match to HA's `media_artist`
+in the MA library and fetches its full artist metadata. Artists must be present
+in that library with usable thumbnail, fanart, or landscape artwork. Logos are
+excluded. Multiple artists in one combined metadata string, ambiguous names,
+missing artwork, or artists not in the library are skipped rather than guessed.
+The app does not search stock photos or require a third-party image service.
+
+Photos load in a background task while other pages continue. It tries subsequent
+images after a failed download and removes duplicate URLs and identical rendered
+photos. Images are constrained by the same size limits as album covers. Up to
+32 artists are cached in memory: successful results for one hour and empty/failed
+lookups for five minutes. Tracks by the same artist reuse those photos. Restarting
+clears the cache. Changing artists clears the previous photo pages and cancels
+an old lookup; pausing and stopping retain the existing pause-then-off behavior.
+When a new set of photos arrives, the page cycle restarts on the cover.
+
+The MA token is used only for MA API and MA-proxied image requests. Public image
+hosts receive no MA token, and neither MA nor external hosts receive the
+Supervisor token. Missing credentials skip photo pages and are reported at
+startup without preventing cover, information, or equalizer pages.
+
 ## Track Information
 
 The display alternates between a full-screen album cover and a separate
@@ -100,7 +145,7 @@ these pages by default. With `pause_then_off: false` and `idle_action: keep`, th
 last rendered frame stays visible, including its last countdown value.
 
 Updating from 0.2.0 replaces the compact layout with these two pages. Set
-both `show_track_info: false` and `show_equalizer: false`, then restart the app
+`show_artist_images: false`, `show_track_info: false`, and `show_equalizer: false`, then restart the app
 for an uninterrupted 64x64 cover.
 The HA polling
 interval still defaults to five seconds; the text/countdown render loop runs
@@ -126,8 +171,9 @@ as a visual equalizer; it does not change audio frequencies or volume.
   so the cover and spectrum represent the same music.
 5. Save and restart the app. Configure WLED for DDP as described below.
 
-With both optional pages enabled, the cycle is **cover > track information >
-equalizer > cover**, with `page_interval` applying to each page. Disabling
+With artist photos disabled and both other optional pages enabled, the cycle is
+**cover > track information > equalizer > cover**, with `page_interval` applying
+to each page. Artist photos, when enabled and available, come after the cover. Disabling
 `show_track_info` gives **cover > equalizer > cover**. Rotation applies to the
 equalizer as well. Silence shows empty bars, not simulated audio. While the
 equalizer page is rendering, missing or invalid packets clear the bars after
@@ -229,6 +275,9 @@ the app restores the cover if music is still playing.
 
 - **No cover:** verify the MA integration exposes artwork and the correct player
   is `playing`. Check `player_entities`; an empty list follows all MA players.
+- **No artist photos:** enable `show_artist_images`, configure the MA URL/token,
+  and check that the artist name matches one MA library artist with usable images.
+  Failed lookups are cached for five minutes; restart after correcting settings.
 - **HTTP 401/403:** stop and start the app to obtain its Supervisor token. No
   long-lived user token should be configured.
 - **HTTP 404:** the HA media proxy may be temporarily unavailable during a track

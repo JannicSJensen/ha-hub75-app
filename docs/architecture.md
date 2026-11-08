@@ -35,6 +35,36 @@ does not write presets or upload files to the controller's flash storage.
 
 ## Caching and Recovery
 
+### Artist Photos
+
+`show_artist_images` enables optional artist-photo lookup through authenticated
+Music Assistant HTTP commands. `music/artists/library_items` searches HA's artist
+name, followed by `music/artists/get` only for a unique normalized exact match.
+The library must contain the artist. No heuristic artist-name splitting, stock
+search, or external fallback is used. `music_assistant_url` and the password-field
+`music_assistant_token` are independent of HA's Supervisor credential.
+
+A background task downloads up to `artist_image_count` distinct photos (maximum
+three). Only thumb/fanart/landscape images are accepted. Public URLs receive no
+credentials; proxy-ID and legacy path/provider imageproxy requests use only the
+MA token. The existing streaming image-size limit, Pillow decoder, padding and
+shared rotation apply. Failed images are skipped, and identical RGB frames are
+deduplicated. A 45-second overall lookup timeout bounds optional work.
+
+An LRU cache holds up to 32 artists, expiring successful results after one hour
+and negative results after five minutes. A changed artist cancels/awaits the old
+task and removes old photos; only results for the current artist become visible.
+Photos arriving asynchronously restart the page cycle at the cover, avoiding
+mid-cycle page-count jumps. Shutdown cancels/awaits the task before closing the
+shared HTTP session. No artist request blocks normal frame rendering.
+
+The shared renderer inserts available photos after the cover and before optional
+information/equalizer pages. It counts actual pages, so unavailable photos do
+not create blank or repeated pages. Metadata scrolling continues to count time
+spent on information pages even with extra photo pages between visits.
+
+### Playback Frames
+
 The artwork URL, decoded cover, and last successful frame's chunks are cached in
 memory. Unchanged artwork is not downloaded again. With track information
 enabled, a render loop interpolates elapsed playback from HA's
@@ -155,3 +185,8 @@ Audio Sync tests cover exact MA/WLED packet decoding, invalid packet rejection,
 real loopback multicast reception, silence and stale-data clearing, equalizer
 page order, pixel bounds, both transports, rotation, track resets, pause
 overrides, idle startup, opt-in receiver lifecycle, and manifest network/options.
+
+Artist-page tests cover page order and limits, MA command shapes, public/proxy
+credential isolation, duplicate images, failed/ambiguous/missing library matches,
+negative-cache expiry, artist changes, DDP rotation, unchanged-cover reuse, slow
+background requests, and cancellation at shutdown.

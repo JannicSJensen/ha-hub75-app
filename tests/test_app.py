@@ -52,6 +52,10 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(config["options"]["audio_sync_port"], 11988)
         self.assertEqual(config["schema"]["audio_sync_port"], "port")
         self.assertEqual(config["options"]["audio_sync_interface"], "0.0.0.0")
+        self.assertFalse(config["options"]["show_artist_images"])
+        self.assertEqual(config["options"]["artist_image_count"], 3)
+        self.assertEqual(config["schema"]["artist_image_count"], "int(1,3)")
+        self.assertEqual(config["schema"]["music_assistant_token"], "password?")
         self.assertNotIn("image", config)
         self.assertRegex(config["version"], r"^\d+\.\d+\.\d+$")
         changelog = (root / "hub75" / "CHANGELOG.md").read_text()
@@ -216,6 +220,40 @@ class RotationTests(unittest.TestCase):
             APP.rotate_frame(Image.new("RGB", (64, 64)), "30")
 
 
+class ArtistPageTests(unittest.TestCase):
+    def test_cover_artist_photos_information_equalizer_rotation_order(self):
+        cover = Image.new("RGB", (64, 64), "red")
+        photos = [Image.new("RGB", (64, 64), color) for color in ("blue", "green", "yellow")]
+        spectrum = [128] * 16
+        expected = [cover, *photos, APP.render_frame(cover, player(), 8),
+                    APP.render_equalizer(spectrum), cover]
+        for index, frame in enumerate(expected):
+            actual = APP.render_frame(cover, player(), index * 8,
+                                      artist_images=photos, equalizer=spectrum)
+            self.assertEqual(actual.tobytes(), frame.tobytes())
+
+    def test_artist_pages_without_information_and_limit_three(self):
+        cover = Image.new("RGB", (64, 64), "red")
+        photos = [Image.new("RGB", (64, 64), "blue")] * 4
+        actual = APP.render_frame(cover, player(), 32, artist_images=photos,
+                                  show_track_info=False)
+        self.assertEqual(actual.tobytes(), cover.tobytes())
+
+    def test_artist_image_sources_ignore_logos_and_deduplicate(self):
+        artist = {"image": {"type": "thumb", "path": "https://example.com/photo.png",
+                            "remotely_accessible": True}, "metadata": {"images": [
+            {"type": "thumb", "path": "https://example.com/photo.png", "remotely_accessible": True},
+            {"type": "logo", "path": "https://example.com/logo.png", "remotely_accessible": True},
+            {"type": "fanart", "path": "provider-path", "proxy_id": "image/123"},
+            {"type": "landscape", "path": "artist/photo.jpg", "provider": "test"},
+        ]}}
+        sources = APP.artist_image_sources(artist, "http://ma")
+        self.assertEqual(len(sources), 3)
+        self.assertEqual(sources[0], ("https://example.com/photo.png", False))
+        self.assertEqual(sources[1], ("http://ma/imageproxy/image%2F123?size=64", True))
+        self.assertIn("path=artist%252Fphoto.jpg", sources[2][0])
+
+
 class AudioSyncTests(unittest.TestCase):
     def packet(self, spectrum):
         import struct
@@ -332,6 +370,13 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.states = [player()]
         self.posts = []
         self.auth = []
+        self.ma_calls = []
+        self.ma_matches = [{"name": "Artist", "item_id": "7", "provider": "library"}]
+        self.ma_detail = {"name": "Artist", "metadata": {"images": []}}
+        self.artist_auth = []
+        self.artist_art = image_bytes(Image.new("RGB", (64, 64), "blue"))
+        self.ma_error = False
+        self.ma_gate = None
         self.matrix = {"w": 64, "h": 64}
         self.healthy = True
         self.frozen = True
@@ -343,6 +388,9 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         server.router.add_get("/core/api/states", self.get_states)
         server.router.add_get("/core/api/media_player_proxy/cover", self.get_art)
         server.router.add_get("/external-cover", self.get_art)
+        server.router.add_post("/api", self.ma_api)
+        server.router.add_get("/artist-photo", self.artist_photo)
+        server.router.add_get("/imageproxy/{image_id}", self.artist_photo)
         server.router.add_get("/json/info", self.get_info)
         server.router.add_get("/json/cfg", self.get_config)
         server.router.add_get("/json/state", self.get_state)
@@ -373,8 +421,154 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.auth.append(request.headers.get("Authorization"))
         return web.Response(body=self.art, content_type="image/png")
 
+    async def ma_api(self, request):
+        self.assertEqual(request.headers.get("Authorization"), "Bearer ma-token")
+        payload = await request.json()
+        self.ma_calls.append(payload)
+        if self.ma_gate is not None:
+            await self.ma_gate.wait()
+        if self.ma_error:
+            return web.json_response({"error": "invalid-token"}, status=401)
+        if payload["command"] == "music/artists/library_items":
+            return web.json_response(self.ma_matches)
+        self.assertEqual(payload["command"], "music/artists/get")
+        self.assertEqual(payload["args"]["item_id"], "7")
+        return web.json_response(self.ma_detail)
+
+    async def artist_photo(self, request):
+        self.artist_auth.append(request.headers.get("Authorization"))
+        if request.query.get("fail"):
+            return web.Response(status=404)
+        data = (image_bytes(Image.new("RGB", (64, 64), request.query["color"]))
+                if "color" in request.query else self.artist_art)
+        return web.Response(body=data, content_type="image/png")
+
+    def enable_artists(self):
+        self.bridge.artist_enabled = True
+        self.bridge.ma_url = self.base
+        self.bridge.ma_token = "ma-token"
+        self.states[0]["attributes"]["media_artist"] = "Artist"
+        self.ma_detail["metadata"]["images"] = [
+            {"type": "thumb", "path": self.base + "/artist-photo", "remotely_accessible": True},
+        ]
+
+    async def test_artist_photos_load_in_background_and_cache_without_cover_download(self):
+        self.enable_artists()
+        await self.bridge.update()
+        self.assertEqual(len(self.posts), 17)
+        await self.bridge.artist_task
+        self.assertEqual(len(self.bridge.artist_images), 1)
+        self.bridge.scroll_started -= 8
+        await self.bridge.update(poll=False)
+        self.assertEqual(self.bridge.last_chunks, APP.pixel_chunks(APP.load_cover(self.artist_art)))
+        self.assertEqual(len(self.auth), 1)
+        self.assertEqual(self.artist_auth, [None])
+        self.assertEqual(len(self.ma_calls), 2)
+        self.states[0]["attributes"]["media_title"] = "Another song"
+        await self.bridge.update()
+        self.assertEqual(len(self.ma_calls), 2)
+
+    async def test_artist_proxy_uses_only_ma_token_and_duplicate_frames_are_skipped(self):
+        self.enable_artists()
+        self.ma_detail["metadata"]["images"].append(
+            {"type": "fanart", "path": "private-image", "proxy_id": "second"})
+        await self.bridge.update()
+        await self.bridge.artist_task
+        self.assertEqual(self.artist_auth, [None, "Bearer ma-token"])
+        self.assertEqual(len(self.bridge.artist_images), 1)
+
+    async def test_failed_artist_lookup_does_not_block_playback_and_is_negative_cached(self):
+        self.enable_artists()
+        self.ma_error = True
+        with self.assertLogs("hub75", level="WARNING"):
+            await self.bridge.update()
+            await self.bridge.artist_task
+        self.assertEqual(self.bridge.artist_images, ())
+        self.assertEqual(len(self.posts), 17)
+        await self.bridge.update()
+        self.assertEqual(len(self.ma_calls), 1)
+
+    async def test_ambiguous_artist_or_missing_credentials_skips_photos(self):
+        self.enable_artists()
+        self.ma_matches.append(dict(self.ma_matches[0], item_id="8"))
+        await self.bridge.update()
+        await self.bridge.artist_task
+        self.assertEqual(self.bridge.artist_images, ())
+        self.assertEqual(len(self.ma_calls), 1)
+        self.bridge.ma_token = ""
+        self.bridge.artist_cache.clear()
+        await self.bridge.update()
+        self.assertEqual(len(self.ma_calls), 1)
+
+    async def test_artist_change_clears_photos_and_idle_cancels_lookup(self):
+        self.enable_artists()
+        await self.bridge.update()
+        await self.bridge.artist_task
+        self.states[0]["attributes"]["media_artist"] = "Other Artist"
+        await self.bridge.update()
+        self.assertEqual(self.bridge.artist_images, ())
+        self.states = []
+        await self.bridge.update()
+        self.assertIsNone(self.bridge.artist_task)
+        self.assertEqual(self.bridge.artist_images, ())
+
     async def get_info(self, request):
         return web.json_response({"leds": {"matrix": self.matrix}, "live": self.healthy})
+
+    async def test_artist_image_limit_failures_and_ddp_rotation(self):
+        self.enable_ddp()
+        self.enable_artists()
+        self.bridge.artist_image_count = 2
+        self.bridge.options["rotation"] = "90"
+        for query in ("?fail=1", "?color=green", "?color=yellow"):
+            self.ma_detail["metadata"]["images"].append({
+                "type": "fanart", "path": self.base + "/artist-photo" + query,
+                "remotely_accessible": True,
+            })
+        await self.bridge.update()
+        await self.receive_ddp()
+        await self.bridge.artist_task
+        self.assertEqual(len(self.bridge.artist_images), 2)
+        self.assertEqual(len(self.artist_auth), 3)
+        self.bridge.scroll_started -= 8
+        await self.bridge.update(poll=False)
+        self.assertEqual(await self.receive_ddp(),
+                         APP.rotate_frame(self.bridge.artist_images[0], "90").tobytes())
+        self.bridge.scroll_started -= 8
+        await self.bridge.update(poll=False)
+        self.assertEqual(await self.receive_ddp(),
+                         APP.rotate_frame(self.bridge.artist_images[1], "90").tobytes())
+        self.assertEqual(len(self.auth), 1)
+        self.assertEqual(self.bridge.render_interval(), 0.5)
+
+    async def test_slow_artist_lookup_does_not_block_cover_and_is_cancelled_on_close(self):
+        import asyncio
+
+        self.enable_artists()
+        self.ma_gate = asyncio.Event()
+        try:
+            await self.bridge.update()
+            self.assertEqual(len(self.posts), 17)
+            task = self.bridge.artist_task
+            self.assertFalse(task.done())
+            await self.bridge.close()
+            self.assertTrue(task.cancelled())
+            self.assertIsNone(self.bridge.artist_task)
+        finally:
+            self.ma_gate.set()
+
+    async def test_artist_cache_expiry_and_missing_library_match(self):
+        self.enable_artists()
+        self.ma_matches = []
+        await self.bridge.update()
+        await self.bridge.artist_task
+        self.assertEqual(self.bridge.artist_images, ())
+        self.bridge.artist_cache["artist"] = (0, ())
+        self.ma_matches = [{"name": "Artist", "item_id": "7", "provider": "library"}]
+        await self.bridge.update()
+        await self.bridge.artist_task
+        self.assertEqual(len(self.bridge.artist_images), 1)
+        self.assertEqual(len(self.ma_calls), 3)
 
     async def get_config(self, request):
         self.assertNotIn("Authorization", request.headers)

@@ -2,8 +2,9 @@
 
 A standalone Home Assistant app that displays Music Assistant album artwork,
 song title, artist, album, and remaining playing time on a 64x64 HUB75 matrix
-running WLED. No Dasher dependency, HA YAML automation,
-Music Assistant API key, or manually created Home Assistant token is required.
+running WLED. No Dasher dependency, HA YAML automation, or manually created
+Home Assistant token is required. Core playback pages need no Music Assistant
+API token; optional artist photos use separate MA URL/token settings.
 
 ## Requirements
 
@@ -51,7 +52,14 @@ Each page stays visible for eight seconds by default; change `page_interval`
 to adjust that duration. New songs start on the cover page. Long text scrolls
 horizontally and continues across later information pages.
 
-Enable `show_equalizer` to add a third page with 16 live spectrum bars. Set
+Enable `show_artist_images` to add up to three full-screen artist photos between
+the cover and track information. Set `music_assistant_url` and
+`music_assistant_token`, then choose `artist_image_count` from one to three.
+Photos load in the background and are cached per artist. Missing or ambiguous
+library artists and failed images are skipped; duplicate photos are not repeated.
+See the [artist photo setup guide](hub75/DOCS.md#artist-photos).
+
+Enable `show_equalizer` to add the final page with 16 live spectrum bars. Set
 `audio_sync_port` to the Music Assistant WLED Audio Sync zone's port (default
 11988) and group that zone with the speaker being followed. The app receives
 analysis data, not audio, and renders it at up to 20 FPS with DDP. No microphone
@@ -60,8 +68,8 @@ or Audio Reactive firmware is needed on the panel. See the
 
 The countdown advances every second on the information page using HA's playback
 position timestamp between HA polls; live streams without a duration show
-`--:--`. Disable both `show_track_info` and `show_equalizer` to show only the
-full-screen cover.
+`--:--`. Disable `show_artist_images`, `show_track_info`, and `show_equalizer`
+to show only the full-screen cover.
 
 Use the `rotation` dropdown to rotate all pages clockwise by 0, 45, 90, 135,
 or 180 degrees. The default is 0. Diagonal rotations are scaled to fit the
@@ -102,4 +110,4 @@ docker build -t ha-hub75-app:dev hub75
 The tests validate the HA manifest and run against mock HTTP servers and a local
 UDP receiver, with no HA
 credentials or physical display required. CI tests Python 3.13 and builds both
-CPU architectures. The configured app version is `0.7.0`.
+CPU architectures. The configured app version is `0.8.0`.

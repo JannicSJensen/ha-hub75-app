@@ -5,7 +5,12 @@ automatically follows playing Music Assistant media players and preserves the
 display's current brightness. A full-screen cover alternates with a separate
 page showing scrolling song title, artist, album, and a large live countdown.
 Each page is visible for eight seconds by default; configure `page_interval`
-to change this. Disable both optional pages for an uninterrupted album cover.
+to change this. Disable all optional pages for an uninterrupted album cover.
+
+Enable `show_artist_images` for up to three full-screen artist photos after the
+cover. Configure the MA server URL and token, then set `artist_image_count` to
+one, two, or three. Available photos are cached; missing and duplicate photos
+are skipped. The rotation is cover, artist photos, track information, equalizer.
 
 When music stops or pauses, the app displays "music paused" for one minute,
 then turns WLED off. Resuming music cancels the shutdown and restores the cover.

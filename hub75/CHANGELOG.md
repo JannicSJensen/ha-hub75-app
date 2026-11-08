@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.0
+
+- Add optional artist-photo pages between the album cover and track-information page.
+- Configure one to three photos with `artist_image_count`; include only distinct, available images.
+- Fetch artist artwork from the Music Assistant library through optional MA URL/token settings.
+- Load photos in the background, cache them per artist, and skip failed or ambiguous lookups.
+- Support public artwork and authenticated MA image proxies without sharing HA/MA tokens with external hosts.
+- Retain track information, equalizer, rotation, countdown, and pause-then-off behavior.
+
 ## 0.7.0
 
 - Add an optional 16-band equalizer page using Music Assistant's WLED Audio Sync provider.
