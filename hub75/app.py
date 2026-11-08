@@ -7,8 +7,12 @@ import logging
 import math
 import os
 import signal
+import socket
+import struct
 import time
 from datetime import datetime, timezone
+from contextlib import suppress
+from ipaddress import IPv4Address
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -17,6 +21,10 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 LOGGER = logging.getLogger("hub75")
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+DDP_PORT = 4048
+DDP_PAYLOAD_BYTES = 1440
+AUDIO_SYNC_GROUP = "239.0.0.1"
+AUDIO_SYNC_PACKET = struct.Struct("<6s2sffBB16sHff")
 Image.MAX_IMAGE_PIXELS = 16 * 1024 * 1024
 
 
@@ -69,12 +77,42 @@ def remaining_time(player, now=None):
     return f"-{minutes}:{seconds:02}"
 
 
-def render_frame(cover, player, scroll_seconds=0, now=None, page_interval=8):
-    page_seconds = max(0, scroll_seconds) % (2 * page_interval)
-    if page_seconds < page_interval:
+def decode_audio_sync(packet):
+    if len(packet) != AUDIO_SYNC_PACKET.size:
+        return None
+    header, _, sample_raw, sample_smth, _, _, spectrum, _, magnitude, frequency = (
+        AUDIO_SYNC_PACKET.unpack(packet))
+    if header != b"00002\x00" or not all(math.isfinite(value) for value in (
+            sample_raw, sample_smth, magnitude, frequency)):
+        return None
+    return tuple(spectrum)
+
+
+def render_equalizer(spectrum):
+    if len(spectrum) != 16:
+        raise ValueError("Equalizer requires 16 spectrum bands")
+    frame = Image.new("RGB", (64, 64), "black")
+    draw = ImageDraw.Draw(frame)
+    for index, amplitude in enumerate(spectrum):
+        height = round(max(0, min(255, amplitude)) * 56 / 255)
+        for row in range(height):
+            color = "#73dce8" if row < 28 else "#efc871" if row < 45 else "#ff6678"
+            draw.line((index * 4, 59 - row, index * 4 + 2, 59 - row), fill=color)
+    draw.line((0, 60, 63, 60), fill="#24484c")
+    return frame
+
+
+def render_frame(cover, player, scroll_seconds=0, now=None, page_interval=8,
+                 equalizer=None, show_track_info=True):
+    elapsed = max(0, scroll_seconds)
+    page_count = 1 + bool(show_track_info) + (equalizer is not None)
+    page_index = int(elapsed // page_interval) % page_count
+    if page_index == 0:
         return cover.copy()
-    completed_cycles = max(0, scroll_seconds) // (2 * page_interval)
-    scroll_seconds = completed_cycles * page_interval + page_seconds - page_interval
+    if equalizer is not None and page_index == page_count - 1:
+        return render_equalizer(equalizer)
+    completed_cycles = elapsed // (page_count * page_interval)
+    scroll_seconds = completed_cycles * page_interval + elapsed % page_interval
     frame = Image.new("RGB", (64, 64), "black")
     font = ImageFont.load_default(size=11)
     attributes = player.get("attributes", {})
@@ -139,6 +177,67 @@ def pixel_chunks(image_bytes):
     ]
 
 
+def ddp_packets(rgb_data):
+    if len(rgb_data) != 64 * 64 * 3:
+        raise ValueError("DDP requires a 64x64 RGB frame")
+    return [
+        struct.pack("!BBBBIH", 0x41 if offset + DDP_PAYLOAD_BYTES >= len(rgb_data) else 0x40,
+                    0, 0x0B, 1, offset, len(rgb_data[offset:offset + DDP_PAYLOAD_BYTES]))
+        + rgb_data[offset:offset + DDP_PAYLOAD_BYTES]
+        for offset in range(0, len(rgb_data), DDP_PAYLOAD_BYTES)
+    ]
+
+
+class AudioSyncReceiver(asyncio.DatagramProtocol):
+    def __init__(self, port=11988, interface="0.0.0.0"):
+        self.port = int(port)
+        if not 0 <= self.port <= 65535:
+            raise ValueError("audio_sync_port must be a valid UDP port")
+        self.interface = str(IPv4Address(interface))
+        self.transport = None
+        self.bands = (0,) * 16
+        self.received_at = None
+
+    async def start(self):
+        receiver_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            receiver_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            receiver_socket.bind(("0.0.0.0", self.port))
+            receiver_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                                       socket.inet_aton(AUDIO_SYNC_GROUP)
+                                       + socket.inet_aton(self.interface))
+            receiver_socket.setblocking(False)
+            self.port = receiver_socket.getsockname()[1]
+            self.transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+                lambda: self, sock=receiver_socket)
+        except BaseException:
+            receiver_socket.close()
+            raise
+        LOGGER.info("Receiving WLED Audio Sync on %s:%s (interface %s)",
+                    AUDIO_SYNC_GROUP, self.port, self.interface)
+
+    def datagram_received(self, packet, address):
+        bands = decode_audio_sync(packet)
+        if bands is not None:
+            self.bands = bands
+            self.received_at = time.monotonic()
+
+    def spectrum(self):
+        if self.received_at is None or time.monotonic() - self.received_at >= 2:
+            return (0,) * 16
+        return self.bands
+
+    def clear(self):
+        self.bands = (0,) * 16
+        self.received_at = None
+
+    def close(self):
+        if self.transport is not None:
+            self.transport.close()
+            self.transport = None
+        self.clear()
+
+
 class ArtworkBridge:
     def __init__(self, session, options, token, ha_url="http://supervisor/core/api"):
         self.session = session
@@ -148,6 +247,19 @@ class ArtworkBridge:
         self.display_url = options["display_url"].rstrip("/")
         if urlsplit(self.display_url).scheme not in ("http", "https"):
             raise ValueError("display_url must use HTTP or HTTPS")
+        self.output_protocol = options.get("output_protocol", "http")
+        if self.output_protocol not in ("http", "ddp"):
+            raise ValueError("output_protocol must be http or ddp")
+        self.audio_sync = (AudioSyncReceiver(options.get("audio_sync_port", 11988),
+                                             options.get("audio_sync_interface", "0.0.0.0"))
+                           if options.get("show_equalizer", False) else None)
+        self.ddp_socket = None
+        self.ddp_address = None
+        self.ddp_active = False
+        self.ddp_heartbeat = None
+        self.ddp_lock = asyncio.Lock()
+        self.last_ddp_frame = None
+        self.last_ddp_send = 0
         self.last_artwork = None
         self.last_health_check = 0
         self.owns_display = False
@@ -199,34 +311,134 @@ class ArtworkBridge:
             self.cover = await asyncio.to_thread(load_cover, image_bytes)
             self.cover_url = picture
         frame = self.cover
-        if player is not None and self.options.get("show_track_info", True):
+        if player is not None and (self.options.get("show_track_info", True)
+                                   or self.audio_sync is not None):
             frame = await asyncio.to_thread(
                 render_frame, self.cover, player, time.monotonic() - self.scroll_started,
                 page_interval=self.options.get("page_interval", 8),
+                equalizer=self.audio_sync.spectrum() if self.audio_sync is not None else None,
+                show_track_info=self.options.get("show_track_info", True),
             )
-        full_update = self.last_chunks is None or picture != self.last_artwork
+        missing_frame = (self.last_ddp_frame is None if self.output_protocol == "ddp"
+                         else self.last_chunks is None)
+        full_update = missing_frame or picture != self.last_artwork
         await self.display_frame(frame, full_update)
+
+    async def validate_ddp_settings(self):
+        config = await self.get_json(self.display_url + "/json/cfg")
+        live = config.get("if", {}).get("live", {})
+        if live.get("maxbri") is not False:
+            raise ValueError("DDP requires disabling Force max brightness in WLED Sync Interfaces")
+        if not live.get("en") or not live.get("rlm") or live.get("offset", 0) != 0:
+            raise ValueError("DDP requires realtime reception, LED mapping, and a zero LED offset in WLED")
+        if live.get("timeout", 0) < 10:
+            raise ValueError("DDP requires a WLED realtime timeout of at least one second")
+
+    def close_ddp_socket(self):
+        if self.ddp_socket is not None:
+            self.ddp_socket.close()
+            self.ddp_socket = None
+            self.ddp_address = None
+
+    async def send_ddp_frame(self, rgb_data, force=False):
+        async with self.ddp_lock:
+            await self.send_ddp_packets(rgb_data, force)
+
+    async def send_ddp_packets(self, rgb_data, force):
+        if (not force and rgb_data == self.last_ddp_frame
+                and time.monotonic() - self.last_ddp_send < 0.5):
+            return
+        loop = asyncio.get_running_loop()
+        if self.ddp_socket is None:
+            addresses = await loop.getaddrinfo(urlsplit(self.display_url).hostname, DDP_PORT,
+                                              type=socket.SOCK_DGRAM)
+            family, sock_type, protocol, _, self.ddp_address = addresses[0]
+            self.ddp_socket = socket.socket(family, sock_type, protocol)
+            self.ddp_socket.setblocking(False)
+        self.ddp_active = True
+        try:
+            for packet in ddp_packets(rgb_data):
+                await loop.sock_sendto(self.ddp_socket, packet, self.ddp_address)
+        except OSError:
+            self.close_ddp_socket()
+            self.last_ddp_send = 0
+            raise
+        self.last_ddp_frame = rgb_data
+        self.last_ddp_send = time.monotonic()
+        if self.ddp_heartbeat is None and not self.stopping.is_set():
+            self.ddp_heartbeat = asyncio.create_task(self.run_ddp_heartbeat())
+
+    async def run_ddp_heartbeat(self):
+        while not self.stopping.is_set():
+            try:
+                await asyncio.wait_for(self.stopping.wait(), timeout=0.5)
+            except TimeoutError:
+                try:
+                    await self.keep_ddp_alive()
+                except (OSError, TimeoutError) as error:
+                    LOGGER.warning("DDP keepalive failed (%s); retrying", type(error).__name__)
+
+    async def stop_ddp(self):
+        if self.ddp_heartbeat is not None:
+            self.ddp_heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.ddp_heartbeat
+            self.ddp_heartbeat = None
+        self.close_ddp_socket()
+        self.last_ddp_frame = None
+
+    async def keep_ddp_alive(self):
+        async with self.ddp_lock:
+            if self.output_protocol == "ddp" and self.last_ddp_frame is not None:
+                await self.send_ddp_packets(self.last_ddp_frame, force=False)
+
+    async def turn_off_display(self):
+        payload = {"on": False}
+        if self.output_protocol == "ddp":
+            await self.stop_ddp()
+            payload.update(live=False, tt=0)
+        await self.post_state(payload)
+        self.ddp_active = False
+
+    async def close(self):
+        if self.audio_sync is not None:
+            self.audio_sync.close()
+        await self.stop_ddp()
+        if self.ddp_active:
+            await self.post_state({"live": False})
+            self.ddp_active = False
 
     async def display_frame(self, frame, full_update):
         frame = await asyncio.to_thread(rotate_frame, frame, self.options.get("rotation", "0"))
-        chunks = await asyncio.to_thread(pixel_chunks, frame)
+        chunks = None
+        if self.output_protocol == "http":
+            chunks = await asyncio.to_thread(pixel_chunks, frame)
         async with asyncio.timeout(45):
             if full_update:
                 info = await self.get_json(self.display_url + "/json/info")
                 if info.get("leds", {}).get("matrix") != {"w": 64, "h": 64}:
                     raise ValueError("WLED must be configured as a 64x64 matrix")
-                await self.post_state({
-                    "on": True, "tt": 0,
+                if self.output_protocol == "ddp":
+                    await self.validate_ddp_settings()
+                payload = {
+                    "on": True, "tt": 0, "live": False,
                     "seg": [{
                         "id": 0, "on": True, "start": 0, "stop": 64,
                         "startY": 0, "stopY": 64, "grp": 1, "spc": 0, "of": 0,
                         "rev": False, "rY": False, "mi": False, "mY": False,
                         "tp": False, "m12": 0, "fx": 0,
                     }],
-                })
-            for index, chunk in enumerate(chunks):
-                if full_update or chunk != self.last_chunks[index]:
-                    await self.post_state(chunk)
+                }
+                if self.output_protocol == "ddp":
+                    payload["lor"] = 0
+                    payload["seg"][0]["frz"] = False
+                await self.post_state(payload)
+            if self.output_protocol == "ddp":
+                await self.send_ddp_frame(frame.convert("RGB").tobytes(), force=full_update)
+            else:
+                for index, chunk in enumerate(chunks):
+                    if full_update or chunk != self.last_chunks[index]:
+                        await self.post_state(chunk)
         self.last_chunks = chunks
         self.owns_display = True
         if full_update:
@@ -237,6 +449,9 @@ class ArtworkBridge:
         segment = next((segment for segment in state.get("seg", [])
                         if segment.get("id") == 0), {})
         self.last_health_check = time.monotonic()
+        if self.output_protocol == "ddp":
+            info = await self.get_json(self.display_url + "/json/info")
+            return state.get("on") and segment.get("on") and info.get("live")
         return state.get("on") and segment.get("on") and segment.get("frz")
 
     async def update(self, poll=True):
@@ -246,12 +461,16 @@ class ArtworkBridge:
             self.playback_active = select_player(
                 states, self.options.get("player_entities", []), require_picture=False
             ) is not None
+            if not self.playback_active and self.audio_sync is not None:
+                self.audio_sync.clear()
         if self.playback_active and self.pause_until is not None:
             self.pause_until = None
             self.last_chunks = None
+            self.last_ddp_frame = None
         player = self.current_player
         if player is None:
             if self.playback_active:
+                await self.keep_ddp_alive()
                 return
             self.last_artwork = None
             self.track_key = None
@@ -261,15 +480,19 @@ class ArtworkBridge:
                     self.pause_until = time.monotonic() + 60
                     LOGGER.info("Music paused; turning off WLED in 60 seconds")
                 elif self.owns_display and time.monotonic() >= self.pause_until:
-                    await self.post_state({"on": False})
+                    await self.turn_off_display()
                     self.owns_display = False
                     self.pause_until = None
                     self.last_chunks = None
                     LOGGER.info("Turned off WLED after music paused")
+                elif self.owns_display:
+                    await self.keep_ddp_alive()
             else:
                 if self.options.get("idle_action", "keep") == "off" and self.owns_display:
-                    await self.post_state({"on": False})
+                    await self.turn_off_display()
                     self.owns_display = False
+                elif self.owns_display:
+                    await self.keep_ddp_alive()
                 self.last_chunks = None
             return
         picture = player["attributes"]["entity_picture"]
@@ -280,42 +503,73 @@ class ArtworkBridge:
         if track_key != self.track_key:
             self.scroll_started = time.monotonic()
             self.track_key = track_key
+            if self.audio_sync is not None:
+                self.audio_sync.clear()
         if picture == self.last_artwork:
             healthy = True
             if time.monotonic() - self.last_health_check >= 30:
                 healthy = await self.display_is_healthy()
                 if not healthy:
                     self.last_chunks = None
-            if healthy and not self.options.get("show_track_info", True):
-                return
+                    self.last_ddp_frame = None
+            cover_only = not self.options.get("show_track_info", True) and self.audio_sync is None
+            if healthy and cover_only:
+                if self.output_protocol == "http" or self.last_ddp_frame is not None:
+                    await self.keep_ddp_alive()
+                    return
         await self.display_artwork(picture, player)
         if picture != self.last_artwork:
             LOGGER.info("Updated album artwork from %s", player["entity_id"])
         self.last_artwork = picture
 
+    def render_interval(self):
+        if self.output_protocol == "ddp" and self.owns_display:
+            if self.current_player is not None and self.audio_sync is not None:
+                return 0.05
+            return (0.1 if self.current_player is not None
+                    and self.options.get("show_track_info", True) else 0.5)
+        if (self.options.get("show_track_info", True) or self.audio_sync is not None
+            or self.pause_until is not None):
+            return 1
+        return self.options.get("refresh_interval", 5)
+
     async def run(self):
-        LOGGER.info("Watching Music Assistant; WLED target: %s", self.display_url)
+        try:
+            if self.audio_sync is not None:
+                await self.audio_sync.start()
+            await self.run_updates()
+        finally:
+            await self.close()
+
+    async def run_updates(self):
+        LOGGER.info("Watching Music Assistant; WLED target: %s (%s)",
+                    self.display_url, self.output_protocol)
         next_poll = 0
         while not self.stopping.is_set():
+            poll = (time.monotonic() >= next_poll
+                    or (self.pause_until is not None
+                        and time.monotonic() >= self.pause_until))
+            succeeded = False
             try:
-                poll = (time.monotonic() >= next_poll
-                        or (self.pause_until is not None
-                            and time.monotonic() >= self.pause_until))
                 await self.update(poll=poll)
-                if poll:
-                    next_poll = time.monotonic() + self.options.get("refresh_interval", 5)
+                succeeded = True
             except aiohttp.ClientResponseError as error:
                 LOGGER.warning("HTTP %s from %s; retrying", error.status,
                                error.request_info.real_url.host)
-            except (aiohttp.ClientError, TimeoutError, OSError, ValueError,
+            except ValueError as error:
+                LOGGER.warning("Invalid display configuration or artwork: %s; retrying", error)
+            except (aiohttp.ClientError, TimeoutError, OSError,
                     RuntimeError, Image.DecompressionBombError) as error:
                 LOGGER.warning("Artwork update failed (%s); retrying", type(error).__name__)
                 LOGGER.debug("Failure details", exc_info=True)
+            if poll:
+                next_poll = time.monotonic() + self.options.get("refresh_interval", 5)
             try:
+                interval = min(self.render_interval(), max(0.01, next_poll - time.monotonic()))
+                if not succeeded:
+                    interval = max(1, interval)
                 await asyncio.wait_for(self.stopping.wait(),
-                                       timeout=1 if (self.options.get("show_track_info", True)
-                                                     or self.pause_until is not None)
-                                       else self.options.get("refresh_interval", 5))
+                                       timeout=interval)
             except TimeoutError:
                 pass
 

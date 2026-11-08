@@ -2,10 +2,14 @@
 
 ```yaml
 display_url: http://192.168.2.214
+output_protocol: http
 player_entities: []
 idle_action: keep
 pause_then_off: true
 show_track_info: true
+show_equalizer: false
+audio_sync_port: 11988
+audio_sync_interface: 0.0.0.0
 page_interval: 8
 rotation: "0"
 refresh_interval: 5
@@ -15,11 +19,15 @@ log_level: info
 | Option | Meaning |
 | --- | --- |
 | `display_url` | WLED controller base URL. Default is your wall_01 controller. |
+| `output_protocol` | Dropdown: `http` (default) for JSON pixel uploads, or `ddp` for UDP frame streaming. Both use HTTP for setup and power control. |
 | `player_entities` | Optional list of Music Assistant HA media-player IDs. Empty means all MA players. |
 | `idle_action` | Used only when `pause_then_off` is `false`: `keep` leaves the last frame visible; `off` turns WLED off immediately. |
 | `pause_then_off` | Show "music paused" for 60 seconds after playback stops, then switch WLED off. Default: `true`. Overrides `idle_action`. |
-| `show_track_info` | Alternate cover and track-information pages. Set `false` for an uninterrupted full-cover image. Default: `true`. |
-| `page_interval` | Seconds each page remains visible, from 3 to 60. Default: 8. Ignored when `show_track_info` is `false`. |
+| `show_track_info` | Include the track-information page. Default: `true`. Disable this and `show_equalizer` for an uninterrupted cover. |
+| `show_equalizer` | Include a live 16-band spectrum page using Music Assistant's WLED Audio Sync data. Default: `false`. |
+| `audio_sync_port` | UDP zone port matching the Music Assistant WLED Audio Sync provider. Default: `11988`. Not DDP's port 4048. |
+| `audio_sync_interface` | HA host's local IPv4 address for joining the multicast group. `0.0.0.0` (default) selects the OS default interface. |
+| `page_interval` | Seconds each page remains visible, from 3 to 60. Default: 8. Ignored only when both optional pages are disabled. |
 | `rotation` | Dropdown for clockwise rotation: `0`, `45`, `90`, `135`, or `180` degrees. Default: `0`. Applies to every page. |
 | `refresh_interval` | Seconds between HA checks, from 1 to 60. Default: 5. |
 | `log_level` | `debug`, `info`, `warning`, or `error`. Default: `info`. |
@@ -92,10 +100,100 @@ these pages by default. With `pause_then_off: false` and `idle_action: keep`, th
 last rendered frame stays visible, including its last countdown value.
 
 Updating from 0.2.0 replaces the compact layout with these two pages. Set
-`show_track_info: false` and restart the app for an uninterrupted 64x64 cover.
+both `show_track_info: false` and `show_equalizer: false`, then restart the app
+for an uninterrupted 64x64 cover.
 The HA polling
 interval still defaults to five seconds; the text/countdown render loop runs
-separately at one-second intervals and only uploads changed pixel chunks.
+separately. HTTP renders once per second and only uploads changed pixel chunks.
+DDP renders up to ten times per second, or twenty with the equalizer enabled,
+and sends complete frames when pixels change. The countdown still shows whole seconds.
+
+## Equalizer and Music Assistant Audio Sync
+
+[Music Assistant PR #5537](https://github.com/music-assistant/server/pull/5537)
+is merged into its development branch. Use a Music Assistant version that
+includes the **WLED Audio Sync** provider. This sends analysis features, not
+playable audio or image pixels. The app renders the received 16 spectrum bands
+as a visual equalizer; it does not change audio frequencies or volume.
+
+1. Add a WLED Audio Sync provider/zone in Music Assistant. Note its UDP port,
+  normally `11988`; additional zones may use different ports.
+2. Group that zone's virtual player with the real speaker/player group whose
+  music should drive the visualization, following Music Assistant's setup.
+3. In this app, set `show_equalizer: true` and `audio_sync_port` to that zone's
+  port. Choose `output_protocol: ddp` for smoother animation.
+4. Restrict `player_entities` to the MA speaker/group associated with that zone
+  so the cover and spectrum represent the same music.
+5. Save and restart the app. Configure WLED for DDP as described below.
+
+With both optional pages enabled, the cycle is **cover > track information >
+equalizer > cover**, with `page_interval` applying to each page. Disabling
+`show_track_info` gives **cover > equalizer > cover**. Rotation applies to the
+equalizer as well. Silence shows empty bars, not simulated audio. While the
+equalizer page is rendering, missing or invalid packets clear the bars after
+two seconds. New songs clear old spectrum data and restart on the cover page.
+The default pause screen still replaces all playback pages when music stops.
+
+The app joins multicast **239.0.0.1** on `audio_sync_port`. Host networking is
+enabled in the app manifest so it can receive LAN multicast, including packets
+from Music Assistant on the same HA host. The UDP listener is opened only when
+`show_equalizer` is enabled and is closed on app shutdown. If automatic interface
+selection fails, set `audio_sync_interface` to the HA host's LAN IPv4 address,
+not the WLED controller's address. Multicast must be allowed by the network;
+different VLANs require multicast routing. Audio Sync is unauthenticated, so use
+it only on a trusted LAN.
+
+This is the same zone-port concept as WLED's **audioSyncPort**, but our app is
+the receiver. You do not need to enable Audio Sync reception on the panel or
+install an Audio Reactive usermod/microphone for this renderer. DDP on **4048**
+is the separate outgoing pixel transport. Do not run competing pixel senders
+or native audio-reactive effects on the same panel while the app controls it.
+
+Music Assistant sends up to 40 analysis packets per second. DDP rendering uses
+the latest received bands at up to 20 FPS; HTTP renders about once per second
+and is not recommended for responsive equalizers. Packet delivery, rendering,
+and slow HA requests can introduce latency. The 44-byte packet has no player
+identifier or playback timestamp, so the app cannot automatically select the
+correct room's audio or guarantee sample-perfect synchronization. Use matching
+zones and tune the Music Assistant provider's latency setting against the real
+speaker output. No audio stream is captured by this app.
+
+## Choosing the Output Protocol
+
+Keep `output_protocol: http` for the existing acknowledged JSON uploader.
+Choose `ddp` in the Configuration tab, save, and restart the app to stream RGB24
+pixels directly to the controller over UDP port **4048**. No HACS integration
+or additional HA automation is required. Use the controller's direct LAN URL;
+DDP targets the hostname in `display_url`, not an HTTP proxy or ingress URL.
+Allow UDP 4048 from the app to WLED as well as the existing HTTP connection.
+DDP is not WLED's separate UDP notifier/sync-group protocol.
+
+Before selecting DDP, open WLED **Config > Sync Interfaces** and ensure:
+
+- Realtime data reception is enabled.
+- Realtime LED mapping is enabled, so the existing matrix mapping is respected.
+- **Force max brightness** is disabled. The app refuses DDP if it is enabled.
+- The realtime LED offset is zero.
+- The realtime timeout is at least one second; the normal 2.5-second value works.
+
+The app reads these settings but never changes or saves them. DDP's appearance
+also depends on WLED's realtime gamma setting. There is no automatic gamma,
+contrast, sharpening, or brightness adjustment; both transports carry the same
+rendered RGB pixels. If colors look different, check WLED's realtime gamma
+setting rather than assuming DDP improves image quality.
+
+A complete 64x64 frame uses nine UDP packets. Only the final packet requests
+displaying the frame. UDP has no delivery acknowledgement; packet loss may
+briefly show incomplete frames. Static covers, the last frame in `idle_action:
+keep`, and pause screens are resent every half second. A dedicated resend task
+continues while HA polling or artwork downloads are waiting. Only one sender
+writes packets at a time, and resends use the latest completed frame.
+
+DDP streaming continues throughout the pause minute. At its end the app cancels
+the resend task, closes the UDP socket, and sends HTTP `live: false` and `on:
+false`. No further packets are sent until playback resumes. A successful UDP
+send means the local network accepted the packets, not that WLED acknowledged
+the image; HTTP control failures and local send failures are retried.
 
 ## WLED Setup
 
@@ -110,8 +208,8 @@ not the physical HUB75 wiring, and does not mirror the image.
 Use a HUB75 build of WLED 16.0.1 or newer. Configure the physical panel as 64x64
 and set the 2D matrix size to 64x64. Use one segment for the display. The app
 configures segment 0 to cover the entire matrix and clears segment mirroring,
-rotation, grouping, spacing, and offset. It replaces the running effect with a
-frozen pixel image without modifying saved presets.
+rotation, grouping, spacing, and offset. HTTP replaces the running effect with a
+frozen pixel image; DDP uses realtime mode. Neither modifies saved presets.
 
 Brightness is not raised by the app. Set it in WLED or with `light.wall_01` in
 Home Assistant. A brightness of zero, or a segment brightness of zero, produces
@@ -120,9 +218,11 @@ automatic current limiter does not account for HUB75 power consumption.
 
 The app turns the display on when uploading a cover. While music is playing,
 turning it off or selecting another effect may be undone by the next health
-check within 30 seconds. Stop the app to control WLED independently. Stopping
-the app leaves the display as it is; `idle_action` applies to playback, not to
-app shutdown. Pixel images are not persistent across controller restarts, but
+check within 30 seconds. Stop the app to control WLED independently. In HTTP
+mode stopping leaves the frozen image as it is. In DDP mode stopping releases
+realtime mode and WLED returns to its underlying effect; the streamed image is
+not persisted. `idle_action` applies to playback, not to app shutdown. Pixel
+images are not persistent across controller restarts, but
 the app restores the cover if music is still playing.
 
 ## Troubleshooting
@@ -135,6 +235,16 @@ the app restores the cover if music is still playing.
   change. The app retries on the next polling cycle.
 - **Matrix-size error:** correct WLED's 2D configuration; only 64x64 is supported.
 - **Connection failures:** check the controller URL and LAN reachability from HA.
+- **DDP configuration error:** follow the realtime settings above; unsafe brightness
+  settings are rejected before the app turns the controller on.
+- **DDP shows nothing or flickers:** allow UDP 4048, check realtime overrides and
+  matrix mapping, and stop competing realtime senders. UDP send success does
+  not confirm delivery. Select `http` and restart for an acknowledged fallback.
+- **Equalizer is empty:** confirm the WLED Audio Sync provider exists in your
+  Music Assistant version, its virtual zone is grouped with a playing speaker,
+  and the app's port matches. Check multicast/firewall and interface selection.
+- **Equalizer follows another room or seems early/late:** select the correct
+  zone port and matching `player_entities`, then tune MA's latency setting.
 - **Scrambled display:** check the HUB75 panel's scan rate and WLED wiring setup.
 - **Wrong cover:** restrict `player_entities` when independent rooms play music.
 

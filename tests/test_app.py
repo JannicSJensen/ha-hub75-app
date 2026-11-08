@@ -39,12 +39,19 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(set(config["arch"]), {"amd64", "aarch64"})
         self.assertEqual(set(config["options"]), set(config["schema"]))
         self.assertTrue(config["homeassistant_api"])
+        self.assertTrue(config["host_network"])
         self.assertTrue(config["init"])
         self.assertTrue(config["options"]["show_track_info"])
         self.assertTrue(config["options"]["pause_then_off"])
         self.assertEqual(config["options"]["page_interval"], 8)
         self.assertEqual(config["options"]["rotation"], "0")
         self.assertEqual(config["schema"]["rotation"], "list(0|45|90|135|180)")
+        self.assertEqual(config["options"]["output_protocol"], "http")
+        self.assertEqual(config["schema"]["output_protocol"], "list(http|ddp)")
+        self.assertFalse(config["options"]["show_equalizer"])
+        self.assertEqual(config["options"]["audio_sync_port"], 11988)
+        self.assertEqual(config["schema"]["audio_sync_port"], "port")
+        self.assertEqual(config["options"]["audio_sync_interface"], "0.0.0.0")
         self.assertNotIn("image", config)
         self.assertRegex(config["version"], r"^\d+\.\d+\.\d+$")
         changelog = (root / "hub75" / "CHANGELOG.md").read_text()
@@ -209,6 +216,117 @@ class RotationTests(unittest.TestCase):
             APP.rotate_frame(Image.new("RGB", (64, 64)), "30")
 
 
+class AudioSyncTests(unittest.TestCase):
+    def packet(self, spectrum):
+        import struct
+
+        return struct.pack("<6s2sffBB16sHff", b"00002\x00", b"\x00\x00", 100, 90,
+                           1, 0, bytes(spectrum), 0, 12000, 440)
+
+    def test_music_assistant_v2_packet_decodes_exact_spectrum(self):
+        spectrum = tuple(range(16))
+        packet = self.packet(spectrum)
+        self.assertEqual(len(packet), 44)
+        self.assertEqual(APP.decode_audio_sync(packet), spectrum)
+
+    def test_invalid_audio_sync_packets_are_ignored(self):
+        packet = self.packet([255] * 16)
+        for malformed in (packet[:-1], packet + b"x", b"00001\x00" + packet[6:]):
+            self.assertIsNone(APP.decode_audio_sync(malformed))
+        import struct
+
+        self.assertIsNone(APP.decode_audio_sync(packet[:8] + struct.pack("<f", float("nan"))
+                                               + packet[12:]))
+
+    def test_equalizer_bars_fit_and_silence_is_not_fake_audio(self):
+        frame = APP.render_equalizer([255] * 16)
+        self.assertEqual(frame.size, (64, 64))
+        for index in range(16):
+            self.assertEqual(frame.getpixel((index * 4, 4)), (255, 102, 120))
+            self.assertEqual(frame.getpixel((index * 4 + 3, 59)), (0, 0, 0))
+        silent = APP.render_equalizer([0] * 16)
+        self.assertIsNone(silent.crop((0, 0, 64, 60)).getbbox())
+
+    def test_three_pages_and_cover_equalizer_mode(self):
+        cover = Image.new("RGB", (64, 64), "red")
+        spectrum = [128] * 16
+        self.assertEqual(APP.render_frame(cover, player(), 0, equalizer=spectrum).tobytes(),
+                         cover.tobytes())
+        self.assertEqual(APP.render_frame(cover, player(), 8, equalizer=spectrum).tobytes(),
+                         APP.render_frame(cover, player(), 8).tobytes())
+        self.assertEqual(APP.render_frame(cover, player(), 16, equalizer=spectrum).tobytes(),
+                         APP.render_equalizer(spectrum).tobytes())
+        self.assertEqual(APP.render_frame(cover, player(), 24, equalizer=spectrum).tobytes(),
+                         cover.tobytes())
+        self.assertEqual(APP.render_frame(cover, player(), 8, equalizer=spectrum,
+                                          show_track_info=False).tobytes(),
+                         APP.render_equalizer(spectrum).tobytes())
+
+
+class AudioSyncReceiverTests(unittest.IsolatedAsyncioTestCase):
+    async def test_multicast_receiver_stale_audio_and_cleanup(self):
+        import asyncio
+        import socket
+
+        received = asyncio.Event()
+
+        class Receiver(APP.AudioSyncReceiver):
+            def datagram_received(self, packet, address):
+                super().datagram_received(packet, address)
+                received.set()
+
+        receiver = Receiver(0, "127.0.0.1")
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                          socket.inet_aton("127.0.0.1"))
+        sender.setblocking(False)
+        try:
+            await receiver.start()
+            spectrum = (128,) * 16
+            packet = AudioSyncTests().packet(spectrum)
+            await asyncio.get_running_loop().sock_sendto(sender, packet,
+                                                         (APP.AUDIO_SYNC_GROUP, receiver.port))
+            await asyncio.wait_for(received.wait(), timeout=1)
+            self.assertEqual(receiver.spectrum(), spectrum)
+            receiver.datagram_received(b"invalid", ("127.0.0.1", 1234))
+            self.assertEqual(receiver.spectrum(), spectrum)
+            receiver.received_at -= 3
+            self.assertEqual(receiver.spectrum(), (0,) * 16)
+        finally:
+            sender.close()
+            receiver.close()
+        self.assertIsNone(receiver.transport)
+        self.assertIsNone(receiver.received_at)
+
+    async def test_invalid_interface_is_rejected(self):
+        with self.assertRaises(ValueError):
+            APP.AudioSyncReceiver(interface="not-an-ip")
+
+
+class DDPPacketTests(unittest.TestCase):
+    def test_rgb_packets_reassemble_with_final_push(self):
+        import struct
+
+        frame = Image.new("RGB", (64, 64), (10, 20, 30)).tobytes()
+        packets = APP.ddp_packets(frame)
+        self.assertEqual(len(packets), 9)
+        output = bytearray(len(frame))
+        for index, packet in enumerate(packets):
+            flags, sequence, color_type, destination, offset, length = struct.unpack(
+                "!BBBBIH", packet[:10])
+            self.assertEqual(flags, 0x41 if index == 8 else 0x40)
+            self.assertEqual((sequence, color_type, destination), (0, 0x0B, 1))
+            self.assertEqual(offset, index * 1440)
+            self.assertEqual(length, len(packet) - 10)
+            self.assertLessEqual(len(packet), 1450)
+            output[offset:offset + length] = packet[10:]
+        self.assertEqual(bytes(output), frame)
+
+    def test_invalid_rgb_frame_is_rejected(self):
+        with self.assertRaises(ValueError):
+            APP.ddp_packets(b"invalid")
+
+
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.states = [player()]
@@ -216,6 +334,9 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.auth = []
         self.matrix = {"w": 64, "h": 64}
         self.healthy = True
+        self.frozen = True
+        self.live_settings = {"en": True, "rlm": True, "maxbri": False,
+                      "timeout": 25, "offset": 0}
         self.reject_pixels = False
         self.art = image_bytes(Image.new("RGB", (64, 64), (10, 20, 30)))
         server = web.Application()
@@ -223,6 +344,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         server.router.add_get("/core/api/media_player_proxy/cover", self.get_art)
         server.router.add_get("/external-cover", self.get_art)
         server.router.add_get("/json/info", self.get_info)
+        server.router.add_get("/json/cfg", self.get_config)
         server.router.add_get("/json/state", self.get_state)
         server.router.add_post("/json/state", self.post_state)
         self.runner = web.AppRunner(server)
@@ -239,6 +361,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         }, "supervisor-token", self.base + "/core/api")
 
     async def asyncTearDown(self):
+        await self.bridge.close()
         await self.session.close()
         await self.runner.cleanup()
 
@@ -251,11 +374,15 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         return web.Response(body=self.art, content_type="image/png")
 
     async def get_info(self, request):
-        return web.json_response({"leds": {"matrix": self.matrix}})
+        return web.json_response({"leds": {"matrix": self.matrix}, "live": self.healthy})
+
+    async def get_config(self, request):
+        self.assertNotIn("Authorization", request.headers)
+        return web.json_response({"if": {"live": self.live_settings}})
 
     async def get_state(self, request):
         return web.json_response({"on": self.healthy, "seg": [
-            {"id": 0, "on": True, "frz": self.healthy}
+            {"id": 0, "on": True, "frz": self.healthy and self.frozen}
         ]})
 
     async def post_state(self, request):
@@ -265,6 +392,314 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         if self.reject_pixels and "i" in payload.get("seg", [{}])[0]:
             return web.json_response({"success": False})
         return web.json_response({"success": True})
+
+    def enable_ddp(self):
+        import socket
+
+        self.receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.receiver.bind(("127.0.0.1", 0))
+        self.receiver.setblocking(False)
+        self.addCleanup(self.receiver.close)
+        port_patch = patch.object(APP, "DDP_PORT", self.receiver.getsockname()[1])
+        port_patch.start()
+        self.addCleanup(port_patch.stop)
+        self.bridge.output_protocol = "ddp"
+        self.frozen = False
+
+    async def receive_ddp(self):
+        import asyncio
+
+        packets = [await asyncio.wait_for(
+            asyncio.get_running_loop().sock_recv(self.receiver, 1500), timeout=1
+        ) for _ in range(9)]
+        return b"".join(packet[10:] for packet in packets)
+
+    async def test_ddp_upload_keepalive_and_no_http_pixels(self):
+        self.enable_ddp()
+        await self.bridge.update()
+        self.assertEqual(await self.receive_ddp(), APP.load_cover(self.art).tobytes())
+        self.assertEqual(len(self.posts), 1)
+        self.assertNotIn("bri", self.posts[0])
+        self.bridge.last_ddp_send -= 1
+        await self.bridge.update(poll=False)
+        self.assertEqual(await self.receive_ddp(), APP.load_cover(self.art).tobytes())
+        self.assertEqual(len(self.posts), 1)
+        self.assertEqual(len(self.auth), 1)
+
+    async def test_ddp_pause_keepalive_then_off_and_resume(self):
+        self.enable_ddp()
+        self.bridge.options["pause_then_off"] = True
+        await self.bridge.update()
+        await self.receive_ddp()
+        self.states = []
+        await self.bridge.update()
+        self.assertEqual(await self.receive_ddp(), APP.render_paused_frame().tobytes())
+        deadline = self.bridge.pause_until
+        self.bridge.last_ddp_send -= 1
+        await self.bridge.update(poll=False)
+        self.assertEqual(await self.receive_ddp(), APP.render_paused_frame().tobytes())
+        self.assertEqual(self.bridge.pause_until, deadline)
+        self.bridge.pause_until -= 61
+        await self.bridge.update()
+        self.assertEqual(self.posts[-1], {"on": False, "live": False, "tt": 0})
+        self.assertIsNone(self.bridge.ddp_socket)
+        self.assertIsNone(self.bridge.last_ddp_frame)
+        count = len(self.posts)
+        await self.bridge.update()
+        self.assertEqual(len(self.posts), count)
+        self.states = [player()]
+        await self.bridge.update()
+        self.assertEqual(await self.receive_ddp(), APP.load_cover(self.art).tobytes())
+        self.assertTrue(self.posts[-1]["on"])
+
+    async def test_ddp_rejects_unsafe_brightness_without_takeover(self):
+        self.enable_ddp()
+        self.live_settings["maxbri"] = True
+        with self.assertRaisesRegex(ValueError, "Force max brightness"):
+            await self.bridge.update()
+        self.assertEqual(self.posts, [])
+        self.assertIsNone(self.bridge.ddp_socket)
+
+    async def test_ddp_rotation_and_shutdown_release(self):
+        self.enable_ddp()
+        frame = Image.new("RGB", (64, 64), "black")
+        frame.putpixel((0, 0), (255, 0, 0))
+        self.bridge.options["rotation"] = "90"
+        await self.bridge.display_frame(frame, full_update=True)
+        self.assertEqual(await self.receive_ddp(), APP.rotate_frame(frame, "90").tobytes())
+        await self.bridge.close()
+        self.assertIsNone(self.bridge.ddp_socket)
+        self.assertEqual(self.posts[-1], {"live": False})
+
+    async def test_ddp_heartbeat_continues_without_ha_updates(self):
+        self.enable_ddp()
+        await self.bridge.update()
+        original = await self.receive_ddp()
+        self.assertEqual(await self.receive_ddp(), original)
+        self.assertEqual(len(self.auth), 1)
+        await self.bridge.close()
+        self.assertIsNone(self.bridge.ddp_heartbeat)
+
+    async def test_ddp_send_failure_retries_without_caching_a_new_frame(self):
+        import asyncio
+
+        self.enable_ddp()
+        with patch.object(asyncio.get_running_loop(), "sock_sendto", side_effect=OSError("offline")):
+            with self.assertRaises(OSError):
+                await self.bridge.update()
+        self.assertIsNone(self.bridge.last_ddp_frame)
+        self.assertIsNone(self.bridge.ddp_socket)
+        await self.bridge.update()
+        self.assertEqual(await self.receive_ddp(), APP.load_cover(self.art).tobytes())
+
+    async def test_ddp_pause_upload_failure_and_off_failure_retry(self):
+        import asyncio
+
+        self.enable_ddp()
+        self.bridge.options["pause_then_off"] = True
+        await self.bridge.update()
+        await self.receive_ddp()
+        self.states = []
+        with patch.object(asyncio.get_running_loop(), "sock_sendto", side_effect=OSError("offline")):
+            with self.assertRaises(OSError):
+                await self.bridge.update()
+        self.assertIsNone(self.bridge.pause_until)
+        await self.bridge.update()
+        self.assertEqual(await self.receive_ddp(), APP.render_paused_frame().tobytes())
+        self.bridge.pause_until -= 61
+        deadline = self.bridge.pause_until
+        with patch.object(self.bridge, "post_state", side_effect=RuntimeError("offline")):
+            with self.assertRaises(RuntimeError):
+                await self.bridge.update()
+        self.assertEqual(self.bridge.pause_until, deadline)
+        self.assertIsNone(self.bridge.ddp_heartbeat)
+        self.assertIsNone(self.bridge.ddp_socket)
+        await self.bridge.update()
+        self.assertEqual(self.posts[-1], {"on": False, "live": False, "tt": 0})
+
+    async def test_ddp_pages_and_missing_artwork_keepalive(self):
+        self.enable_ddp()
+        self.bridge.options["show_track_info"] = True
+        self.states[0]["attributes"].update(media_title="Song", media_artist="Artist",
+                                           media_album_name="Album", media_duration=240)
+        await self.bridge.update()
+        cover = await self.receive_ddp()
+        self.bridge.scroll_started -= 8
+        await self.bridge.update(poll=False)
+        information = await self.receive_ddp()
+        self.assertNotEqual(information, cover)
+        self.states[0]["attributes"]["entity_picture"] = None
+        self.bridge.last_ddp_send -= 1
+        await self.bridge.update()
+        self.assertEqual(await self.receive_ddp(), information)
+        self.assertIsNone(self.bridge.pause_until)
+        self.assertEqual(len(self.auth), 1)
+
+    async def test_ddp_health_recovery_uses_realtime_instead_of_freeze(self):
+        self.enable_ddp()
+        await self.bridge.update()
+        await self.receive_ddp()
+        self.bridge.last_health_check = 0
+        await self.bridge.update()
+        self.assertEqual(len(self.posts), 1)
+        self.healthy = False
+        self.bridge.last_health_check = 0
+        await self.bridge.update()
+        self.assertEqual(await self.receive_ddp(), APP.load_cover(self.art).tobytes())
+        self.assertEqual(len(self.posts), 2)
+
+    async def test_ddp_keepalive_uses_latest_frame_after_waiting_for_sender(self):
+        import asyncio
+
+        self.enable_ddp()
+        await self.bridge.update()
+        await self.receive_ddp()
+        latest = Image.new("RGB", (64, 64), "blue").tobytes()
+        async with self.bridge.ddp_lock:
+            resend = asyncio.create_task(self.bridge.keep_ddp_alive())
+            await asyncio.sleep(0)
+            self.bridge.last_ddp_frame = latest
+            self.bridge.last_ddp_send -= 1
+        await resend
+        self.assertEqual(await self.receive_ddp(), latest)
+
+    async def test_ddp_legacy_keep_off_and_no_packets_after_shutdown(self):
+        import asyncio
+
+        self.enable_ddp()
+        await self.bridge.update()
+        original = await self.receive_ddp()
+        self.states = []
+        self.bridge.last_ddp_send -= 1
+        await self.bridge.update()
+        self.assertEqual(await self.receive_ddp(), original)
+        self.bridge.options["idle_action"] = "off"
+        await self.bridge.update()
+        self.assertIsNone(self.bridge.ddp_heartbeat)
+        self.assertIsNone(self.bridge.ddp_socket)
+        with self.assertRaises(TimeoutError):
+            await asyncio.wait_for(asyncio.get_running_loop().sock_recv(self.receiver, 1500),
+                                   timeout=0.6)
+
+    async def test_ddp_resume_during_pause_cancels_off_and_starts_cover_page(self):
+        self.enable_ddp()
+        self.bridge.options.update(pause_then_off=True, show_track_info=True)
+        await self.bridge.update()
+        cover = await self.receive_ddp()
+        self.states[0]["state"] = "paused"
+        await self.bridge.update()
+        await self.receive_ddp()
+        self.states[0]["state"] = "playing"
+        await self.bridge.update()
+        self.assertEqual(await self.receive_ddp(), cover)
+        self.assertIsNone(self.bridge.pause_until)
+
+    async def test_equalizer_page_streams_received_bands_and_clears_stale_audio(self):
+        self.enable_ddp()
+        self.bridge.audio_sync = APP.AudioSyncReceiver()
+        self.bridge.options["show_track_info"] = True
+        await self.bridge.update()
+        await self.receive_ddp()
+        spectrum = (200,) * 16
+        self.bridge.audio_sync.datagram_received(AudioSyncTests().packet(spectrum),
+                                                 ("127.0.0.1", 11988))
+        self.bridge.scroll_started -= 16
+        await self.bridge.update(poll=False)
+        self.assertEqual(await self.receive_ddp(), APP.render_equalizer(spectrum).tobytes())
+        self.assertEqual(self.bridge.render_interval(), 0.05)
+        self.bridge.audio_sync.received_at -= 3
+        await self.bridge.update(poll=False)
+        self.assertEqual(await self.receive_ddp(), APP.render_equalizer((0,) * 16).tobytes())
+        self.assertEqual(len(self.auth), 1)
+
+    async def test_equalizer_without_info_flips_and_rotates_then_pause_overrides(self):
+        self.enable_ddp()
+        self.bridge.audio_sync = APP.AudioSyncReceiver()
+        self.bridge.options.update(show_track_info=False, pause_then_off=True, rotation="90")
+        await self.bridge.update()
+        await self.receive_ddp()
+        spectrum = tuple(index * 16 for index in range(16))
+        self.bridge.audio_sync.datagram_received(AudioSyncTests().packet(spectrum),
+                                                 ("127.0.0.1", 11988))
+        self.bridge.scroll_started -= 8
+        await self.bridge.update(poll=False)
+        self.assertEqual(await self.receive_ddp(),
+                         APP.rotate_frame(APP.render_equalizer(spectrum), "90").tobytes())
+        self.states = []
+        await self.bridge.update()
+        self.assertEqual(await self.receive_ddp(),
+                         APP.rotate_frame(APP.render_paused_frame(), "90").tobytes())
+        self.assertEqual(self.bridge.audio_sync.spectrum(), (0,) * 16)
+
+    async def test_equalizer_listener_is_opt_in_and_closed_when_run_exits(self):
+        from unittest.mock import AsyncMock
+
+        self.assertIsNone(self.bridge.audio_sync)
+        configured = APP.ArtworkBridge(self.session, {"display_url": self.base,
+                                                      "show_equalizer": True,
+                                                      "audio_sync_port": 12000}, "token")
+        self.assertEqual(configured.audio_sync.port, 12000)
+        self.bridge.audio_sync = APP.AudioSyncReceiver(0, "127.0.0.1")
+        with patch.object(self.bridge, "run_updates", new=AsyncMock(side_effect=RuntimeError("test"))):
+            with self.assertRaises(RuntimeError):
+                await self.bridge.run()
+        self.assertIsNone(self.bridge.audio_sync.transport)
+
+    async def test_http_equalizer_uploads_only_changed_chunks(self):
+        self.bridge.audio_sync = APP.AudioSyncReceiver()
+        self.bridge.options["show_track_info"] = False
+        await self.bridge.update()
+        self.posts.clear()
+        self.bridge.audio_sync.datagram_received(AudioSyncTests().packet([128] * 16),
+                                                 ("127.0.0.1", 11988))
+        self.bridge.scroll_started -= 8
+        await self.bridge.update(poll=False)
+        self.assertEqual(self.bridge.last_chunks, APP.pixel_chunks(APP.render_equalizer([128] * 16)))
+        self.assertGreater(len(self.posts), 0)
+        self.assertEqual(self.bridge.render_interval(), 1)
+
+    async def test_equalizer_packets_do_not_take_over_an_idle_display(self):
+        self.bridge.audio_sync = APP.AudioSyncReceiver()
+        self.bridge.options["pause_then_off"] = True
+        self.states = []
+        self.bridge.audio_sync.datagram_received(AudioSyncTests().packet([255] * 16),
+                                                 ("127.0.0.1", 11988))
+        await self.bridge.update()
+        self.assertEqual(self.posts, [])
+        self.assertFalse(self.bridge.owns_display)
+
+    async def test_equalizer_new_track_resets_cycle_and_clears_old_spectrum(self):
+        self.enable_ddp()
+        self.bridge.audio_sync = APP.AudioSyncReceiver()
+        await self.bridge.update()
+        cover = await self.receive_ddp()
+        self.bridge.audio_sync.datagram_received(AudioSyncTests().packet([255] * 16),
+                                                 ("127.0.0.1", 11988))
+        self.bridge.scroll_started -= 16
+        await self.bridge.update(poll=False)
+        await self.receive_ddp()
+        self.states[0]["attributes"]["media_title"] = "Another song"
+        await self.bridge.update()
+        self.assertEqual(await self.receive_ddp(), cover)
+        self.assertEqual(self.bridge.audio_sync.spectrum(), (0,) * 16)
+
+    async def test_transport_render_intervals_and_invalid_settings(self):
+        self.assertEqual(self.bridge.render_interval(), 5)
+        self.enable_ddp()
+        self.bridge.owns_display = True
+        self.assertEqual(self.bridge.render_interval(), 0.5)
+        self.bridge.options["show_track_info"] = True
+        self.bridge.current_player = player()
+        self.assertEqual(self.bridge.render_interval(), 0.1)
+        for key, value in (("en", False), ("rlm", False), ("offset", 1), ("timeout", 0)):
+            original = self.live_settings[key]
+            self.live_settings[key] = value
+            with self.assertRaises(ValueError):
+                await self.bridge.validate_ddp_settings()
+            self.live_settings[key] = original
+        with self.assertRaisesRegex(ValueError, "output_protocol"):
+            APP.ArtworkBridge(self.session, {"display_url": self.base,
+                                             "output_protocol": "invalid"}, "token")
 
     async def test_upload_then_skip_unchanged_artwork(self):
         await self.bridge.update()

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.0
+
+- Add an optional 16-band equalizer page using Music Assistant's WLED Audio Sync provider.
+- Receive version-2 Audio Sync packets on multicast 239.0.0.1 with a configurable zone port and interface.
+- Add `show_equalizer` (disabled by default), `audio_sync_port` (11988), and `audio_sync_interface`.
+- Rotate between cover, track information, and equalizer; support cover/equalizer mode without track information.
+- Render equalizer-enabled DDP playback at up to 20 FPS, retaining HTTP support at a slower rate.
+- Clear stale spectrum data after two seconds and retain the pause-then-off behavior.
+- Enable host networking for multicast reception; open the Audio Sync listener only when equalizer is enabled.
+- Document Music Assistant zone grouping, latency limits, and separation from DDP pixel streaming.
+
+## 0.6.0
+
+- Add an `output_protocol` dropdown: HTTP JSON (default) or native DDP over UDP port 4048.
+- Render DDP track-information pages at up to ten frames per second for smoother scrolling.
+- Resend static frames every half second, independently of HA requests.
+- Preserve rotation, page flipping, cover caching, and the one-minute pause screen in both modes.
+- Stop DDP streaming and release realtime mode before powering WLED off or stopping the app.
+- Validate WLED realtime reception, LED mapping, timeout, and brightness settings without changing saved configuration.
+- Test packet layout, real local UDP delivery, concurrent resends, and transport failure recovery.
+
 ## 0.5.0
 
 - Add a configuration dropdown for clockwise rotation: 0, 45, 90, 135, or 180 degrees.

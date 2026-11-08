@@ -11,6 +11,8 @@ Music Assistant API key, or manually created Home Assistant token is required.
 - An amd64 or aarch64 host.
 - WLED 16.0.1 or newer with HUB75 support and a configured 64x64 matrix.
 - Network access from Home Assistant to the WLED controller.
+- For the optional equalizer, a Music Assistant version with WLED Audio Sync
+	and working multicast between Music Assistant and this app.
 
 ## Install
 
@@ -49,17 +51,32 @@ Each page stays visible for eight seconds by default; change `page_interval`
 to adjust that duration. New songs start on the cover page. Long text scrolls
 horizontally and continues across later information pages.
 
+Enable `show_equalizer` to add a third page with 16 live spectrum bars. Set
+`audio_sync_port` to the Music Assistant WLED Audio Sync zone's port (default
+11988) and group that zone with the speaker being followed. The app receives
+analysis data, not audio, and renders it at up to 20 FPS with DDP. No microphone
+or Audio Reactive firmware is needed on the panel. See the
+[Audio Sync setup guide](hub75/DOCS.md#equalizer-and-music-assistant-audio-sync).
+
 The countdown advances every second on the information page using HA's playback
 position timestamp between HA polls; live streams without a duration show
-`--:--`. Set `show_track_info` to `false` to show only the full-screen cover.
+`--:--`. Disable both `show_track_info` and `show_equalizer` to show only the
+full-screen cover.
 
 Use the `rotation` dropdown to rotate all pages clockwise by 0, 45, 90, 135,
 or 180 degrees. The default is 0. Diagonal rotations are scaled to fit the
 64x64 panel with black padding, keeping the entire image visible.
 
-Initial frames are sent as 16 sequential pixel requests. Subsequent text and
-countdown frames send only changed chunks without downloading the cover again.
-Current brightness is preserved. When all selected Music Assistant players
+The `output_protocol` dropdown selects HTTP JSON (default) or native DDP.
+HTTP sends initial frames as 16 sequential pixel requests and subsequent text
+and countdown frames as changed chunks. DDP sends RGB24 frames over UDP port
+4048, renders scrolling at up to ten frames per second, and resends static
+images every half second. No additional integration is needed. Both modes
+reuse the downloaded cover and preserve current brightness; DDP requires
+WLED's **Force max brightness** setting to be disabled. See the
+[DDP setup instructions](hub75/DOCS.md#choosing-the-output-protocol).
+
+When all selected Music Assistant players
 stop or pause, the display shows "music paused" for 60 seconds and then turns
 WLED off. Resuming music cancels the timer and restores playback; resuming after
 shutdown turns the display back on. This also works in cover-only mode.
@@ -82,6 +99,7 @@ python3 -m venv .venv
 docker build -t ha-hub75-app:dev hub75
 ```
 
-The tests validate the HA manifest and run against mock HTTP servers, with no HA
+The tests validate the HA manifest and run against mock HTTP servers and a local
+UDP receiver, with no HA
 credentials or physical display required. CI tests Python 3.13 and builds both
-CPU architectures. The configured app version is `0.5.0`.
+CPU architectures. The configured app version is `0.7.0`.
