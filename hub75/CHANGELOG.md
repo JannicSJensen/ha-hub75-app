@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0
+
+- Add a configuration dropdown for clockwise rotation: 0, 45, 90, 135, or 180 degrees.
+- Apply rotation consistently to album covers, track information, and the pause screen.
+- Fit diagonal rotations inside the 64x64 panel with black padding instead of cropping.
+
 ## 0.4.0
 
 - Show a centered "music paused" screen for 60 seconds when all selected players stop.

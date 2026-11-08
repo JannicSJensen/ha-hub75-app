@@ -19,7 +19,10 @@ by Supervisor in `/data/options.json`.
    page. Use a large countdown above three fourteen-pixel metadata rows.
 6. Verify WLED reports a 64x64 matrix. Turn it on and configure segment 0 in a
    separate request before writing pixels, preserving its existing brightness.
-7. Upload 16 sequential 256-pixel JSON requests to WLED `/json/state` for an
+7. Apply the configured clockwise `rotation` to the complete frame in the
+   shared uploader. Diagonal rotations expand and then fit within 64x64 with
+   black padding. The same transformation applies to the pause screen.
+8. Upload 16 sequential 256-pixel JSON requests to WLED `/json/state` for an
    initial frame. Subsequent frames only upload chunks whose pixels changed.
 
 WLED's individual-pixel control freezes segment 0. Pixels are row-major;
@@ -87,5 +90,6 @@ unchanged-artwork caching, restart recovery, idle behavior, rejected uploads,
 incorrect matrix dimensions, oversized downloads, countdown extrapolation,
 metadata layout, scrolling, page boundaries, configurable flip intervals,
 new-song page resets, incremental frame uploads, the one-minute pause screen,
-resume cancellation, shutdown retries, and idle startup. HTTP integration tests
+resume cancellation, shutdown retries, idle startup, rotation pixel ordering,
+diagonal fitting, and consistent rotation of all pages. HTTP integration tests
 use in-process aiohttp servers without HA credentials or real hardware.

@@ -7,6 +7,7 @@ idle_action: keep
 pause_then_off: true
 show_track_info: true
 page_interval: 8
+rotation: "0"
 refresh_interval: 5
 log_level: info
 ```
@@ -19,6 +20,7 @@ log_level: info
 | `pause_then_off` | Show "music paused" for 60 seconds after playback stops, then switch WLED off. Default: `true`. Overrides `idle_action`. |
 | `show_track_info` | Alternate cover and track-information pages. Set `false` for an uninterrupted full-cover image. Default: `true`. |
 | `page_interval` | Seconds each page remains visible, from 3 to 60. Default: 8. Ignored when `show_track_info` is `false`. |
+| `rotation` | Dropdown for clockwise rotation: `0`, `45`, `90`, `135`, or `180` degrees. Default: `0`. Applies to every page. |
 | `refresh_interval` | Seconds between HA checks, from 1 to 60. Default: 5. |
 | `log_level` | `debug`, `info`, `warning`, or `error`. Default: `info`. |
 
@@ -96,6 +98,14 @@ interval still defaults to five seconds; the text/countdown render loop runs
 separately at one-second intervals and only uploads changed pixel chunks.
 
 ## WLED Setup
+
+Select `rotation` in the Configuration tab, save, and restart the app to change
+the display orientation. Rotation applies after composing each page, including
+the album cover, countdown, metadata, and "music paused" screen. A 90- or
+180-degree rotation preserves pixel detail. At 45 or 135 degrees, the expanded
+image is scaled down to fit the 64x64 panel with black padding; nothing is
+cropped, but text and artwork become smaller. This rotates the display content,
+not the physical HUB75 wiring, and does not mirror the image.
 
 Use a HUB75 build of WLED 16.0.1 or newer. Configure the physical panel as 64x64
 and set the 2D matrix size to 64x64. Use one segment for the display. The app

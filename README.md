@@ -53,6 +53,10 @@ The countdown advances every second on the information page using HA's playback
 position timestamp between HA polls; live streams without a duration show
 `--:--`. Set `show_track_info` to `false` to show only the full-screen cover.
 
+Use the `rotation` dropdown to rotate all pages clockwise by 0, 45, 90, 135,
+or 180 degrees. The default is 0. Diagonal rotations are scaled to fit the
+64x64 panel with black padding, keeping the entire image visible.
+
 Initial frames are sent as 16 sequential pixel requests. Subsequent text and
 countdown frames send only changed chunks without downloading the cover again.
 Current brightness is preserved. When all selected Music Assistant players
@@ -80,4 +84,4 @@ docker build -t ha-hub75-app:dev hub75
 
 The tests validate the HA manifest and run against mock HTTP servers, with no HA
 credentials or physical display required. CI tests Python 3.13 and builds both
-CPU architectures. The configured app version is `0.4.0`.
+CPU architectures. The configured app version is `0.5.0`.

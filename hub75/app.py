@@ -119,6 +119,17 @@ def render_paused_frame():
     return frame
 
 
+def rotate_frame(frame, degrees):
+    angle = int(degrees)
+    if angle not in (0, 45, 90, 135, 180):
+        raise ValueError("rotation must be 0, 45, 90, 135, or 180 degrees")
+    if angle == 0:
+        return frame
+    rotated = frame.rotate(-angle, resample=Image.Resampling.BICUBIC,
+                           expand=True, fillcolor="black")
+    return ImageOps.pad(rotated, (64, 64), Image.Resampling.LANCZOS, color="black")
+
+
 def pixel_chunks(image_bytes):
     image = image_bytes if isinstance(image_bytes, Image.Image) else load_cover(image_bytes)
     colors = ["%02x%02x%02x" % pixel for pixel in image.convert("RGB").getdata()]
@@ -197,6 +208,7 @@ class ArtworkBridge:
         await self.display_frame(frame, full_update)
 
     async def display_frame(self, frame, full_update):
+        frame = await asyncio.to_thread(rotate_frame, frame, self.options.get("rotation", "0"))
         chunks = await asyncio.to_thread(pixel_chunks, frame)
         async with asyncio.timeout(45):
             if full_update:

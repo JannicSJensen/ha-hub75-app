@@ -1,5 +1,5 @@
 name: HUB75 Album Artwork
-version: "0.4.0"
+version: "0.5.0"
 slug: hub75_album_art
 description: Display Music Assistant album artwork on a WLED HUB75 matrix
 url: https://github.com/JannicSJensen/ha-hub75-app
@@ -17,6 +17,7 @@ options:
   pause_then_off: true
   show_track_info: true
   page_interval: 8
+  rotation: "0"
   refresh_interval: 5
   log_level: info
 schema:
@@ -27,5 +28,6 @@ schema:
   pause_then_off: bool
   show_track_info: bool
   page_interval: int(3,60)
+  rotation: list(0|45|90|135|180)
   refresh_interval: int(1,60)
   log_level: list(debug|info|warning|error)

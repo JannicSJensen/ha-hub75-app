@@ -10,6 +10,9 @@ to change this. Disable `show_track_info` for an uninterrupted album cover.
 When music stops or pauses, the app displays "music paused" for one minute,
 then turns WLED off. Resuming music cancels the shutdown and restores the cover.
 
+Use the `rotation` dropdown to rotate the entire display clockwise by 0, 45,
+90, 135, or 180 degrees. Save the configuration and restart the app to apply it.
+
 Set the controller's URL in the Configuration tab, then start the app. There is
 no separate web interface or Home Assistant automation to configure.
 

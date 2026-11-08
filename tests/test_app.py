@@ -43,6 +43,8 @@ class ManifestTests(unittest.TestCase):
         self.assertTrue(config["options"]["show_track_info"])
         self.assertTrue(config["options"]["pause_then_off"])
         self.assertEqual(config["options"]["page_interval"], 8)
+        self.assertEqual(config["options"]["rotation"], "0")
+        self.assertEqual(config["schema"]["rotation"], "list(0|45|90|135|180)")
         self.assertNotIn("image", config)
         self.assertRegex(config["version"], r"^\d+\.\d+\.\d+$")
         changelog = (root / "hub75" / "CHANGELOG.md").read_text()
@@ -175,6 +177,36 @@ class TrackInfoTests(unittest.TestCase):
         self.assertIsNotNone(frame.crop((0, 19, 64, 34)).getbbox())
         self.assertIsNotNone(frame.crop((0, 35, 64, 50)).getbbox())
         self.assertIsNone(frame.crop((0, 50, 64, 64)).getbbox())
+
+
+class RotationTests(unittest.TestCase):
+    def test_zero_degrees_preserves_pixels(self):
+        frame = Image.new("RGB", (64, 64), "red")
+        self.assertEqual(APP.rotate_frame(frame, "0").tobytes(), frame.tobytes())
+
+    def test_clockwise_rotation_preserves_right_angle_pixels(self):
+        frame = Image.new("RGB", (64, 64), "black")
+        frame.putpixel((0, 0), (255, 0, 0))
+        frame.putpixel((63, 0), (0, 255, 0))
+        rotated = APP.rotate_frame(frame, "90")
+        self.assertEqual(rotated.getpixel((63, 0)), (255, 0, 0))
+        self.assertEqual(rotated.getpixel((63, 63)), (0, 255, 0))
+        rotated = APP.rotate_frame(frame, "180")
+        self.assertEqual(rotated.getpixel((63, 63)), (255, 0, 0))
+        self.assertEqual(rotated.getpixel((0, 63)), (0, 255, 0))
+
+    def test_diagonal_rotations_fit_panel_with_black_corners(self):
+        frame = Image.new("RGB", (64, 64), "white")
+        for angle in ("45", "135"):
+            rotated = APP.rotate_frame(frame, angle)
+            self.assertEqual(rotated.size, (64, 64))
+            self.assertEqual(rotated.getpixel((32, 32)), (255, 255, 255))
+            for corner in ((0, 0), (63, 0), (0, 63), (63, 63)):
+                self.assertEqual(rotated.getpixel(corner), (0, 0, 0))
+
+    def test_unsupported_rotation_is_rejected(self):
+        with self.assertRaises(ValueError):
+            APP.rotate_frame(Image.new("RGB", (64, 64)), "30")
 
 
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
@@ -438,6 +470,24 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.bridge.update()
         self.assertFalse(self.bridge.owns_display)
         self.assertIsNone(self.bridge.pause_until)
+
+    async def test_rotation_applies_to_cover_information_and_pause_pages(self):
+        self.bridge.options.update(rotation="90", show_track_info=True, pause_then_off=True)
+        cover = Image.new("RGB", (64, 64), "black")
+        cover.putpixel((0, 0), (255, 0, 0))
+        self.art = image_bytes(cover)
+        await self.bridge.update()
+        self.assertEqual(self.bridge.last_chunks, APP.pixel_chunks(APP.rotate_frame(cover, "90")))
+        self.bridge.scroll_started -= 8
+        with patch.object(APP, "remaining_time", return_value="-3:00"):
+            await self.bridge.update(poll=False)
+            information = APP.render_frame(cover, self.states[0], 8)
+        self.assertEqual(self.bridge.last_chunks,
+                         APP.pixel_chunks(APP.rotate_frame(information, "90")))
+        self.states = []
+        await self.bridge.update()
+        self.assertEqual(self.bridge.last_chunks,
+                         APP.pixel_chunks(APP.rotate_frame(APP.render_paused_frame(), "90")))
 
 
 if __name__ == "__main__":
