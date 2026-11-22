@@ -10,7 +10,8 @@ by Supervisor in `/data/options.json`.
 
 1. Poll `http://supervisor/core/api/states` using `SUPERVISOR_TOKEN`.
 2. Select a playing `media_player` with `app_id: music_assistant` and artwork,
-   optionally restricted by `player_entities`.
+   optionally restricted by `player_entities`. With `show_album_cover: false`,
+   artwork is not required and cover downloads are skipped.
 3. Choose the player with the most recent `last_changed` timestamp. This is the
    time it entered `playing`, not the time its volume or position last updated.
 4. Download the `entity_picture`. Relative `/api/` pictures use the Supervisor
@@ -41,7 +42,8 @@ does not write presets or upload files to the controller's flash storage.
 `show_video` is opt-in and requires DDP. `VideoPage` selects the latest playing
 MA entity with artist/title independently of artwork availability. Its key
 includes entity, media ID, artist, and title; changes cancel/await old work and
-clear the current frame. Normal rendering still needs a selected cover player.
+clear the current frame. Rendering uses the selected playback player, without
+requiring artwork when the cover is disabled.
 
 An asynchronous worker runs yt-dlp as a subprocess, using flat `ytsearch5`
 metadata followed by full resolution of up to three conservative artist/title
@@ -109,7 +111,10 @@ mid-cycle page-count jumps. Shutdown cancels/awaits the task before closing the
 shared HTTP session. No artist request blocks normal frame rendering.
 
 The shared renderer inserts available photos after the cover and before optional
-information/equalizer pages. It counts actual pages, so unavailable photos do
+information/equalizer pages. The `show_artist_image_1/2/3` switches filter
+distinct available photo slots within `artist_image_count`, after the
+`show_artist_images` group switch. If no photo slot is enabled, lookup is skipped.
+It counts actual pages, so unavailable or disabled photos do
 not create blank or repeated pages. Metadata scrolling continues to count time
 spent on information pages even with extra photo pages between visits.
 
@@ -124,8 +129,17 @@ second; DDP renders up to ten times per second (twenty with equalizer enabled) a
 changes or a keepalive is due. A track/player/metadata
 change resets the page cycle and scroll position even when the cover URL is
 unchanged. Each page is visible for `page_interval` seconds; the cover comes
-first. Metadata scrolling counts time spent on information pages, continuing
+first when enabled. Otherwise the cycle starts with the first enabled, available
+page. Metadata scrolling counts time spent on information pages, continuing
 across later cycles instead of repeatedly showing only the beginning of a line.
+
+The renderer returns no frame when no enabled page is available, rather than
+falling back to a disabled cover. The bridge stops DDP keepalives, turns WLED
+off, and clears display ownership and frame caches. It resumes with a full
+upload when a page becomes available. If all playback pages are configured
+off, the same shutdown happens before HA polling, regardless of idle/pause
+settings. Successful shutdown is remembered to avoid repeated off requests;
+failures remain visible to the normal retry loop.
 
 HTTP full-cover mode skips unchanged frames entirely. Every 30 seconds, the app checks that WLED is
 on and segment 0 is on and frozen (HTTP), or realtime mode is active (DDP).

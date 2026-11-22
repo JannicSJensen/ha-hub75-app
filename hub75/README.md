@@ -27,8 +27,17 @@ one, two, or three. Available photos are cached; missing and duplicate photos
 are skipped. The rotation is cover, artist photos, track information, equalizer,
 then an available video.
 
+Choose screens individually using `show_album_cover`, `show_artist_image_1`,
+`show_artist_image_2`, `show_artist_image_3`, `show_track_info`, `show_equalizer`,
+and `show_video` in the Configuration tab. Artist-photo switches require the
+`show_artist_images` group switch and respect `artist_image_count`.
+Disable the cover to use other pages without album artwork. All playback
+screens disabled turns WLED off immediately. If no enabled page is currently
+available, it stays off until one loads. Save options and restart the app.
+
 When music stops or pauses, the app displays "music paused" for one minute,
-then turns WLED off. Resuming music cancels the shutdown and restores the cover.
+then turns WLED off. Resuming music cancels the shutdown and restores the first
+enabled page. This pause behavior applies when playback screens are enabled.
 
 Use the `rotation` dropdown to rotate the entire display clockwise by 0, 45,
 90, 135, or 180 degrees. Save the configuration and restart the app to apply it.

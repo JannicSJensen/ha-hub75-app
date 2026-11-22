@@ -25,7 +25,7 @@ your Music Assistant artwork replaces them during playback.
 | **Music paused** | **Equalizer animation** |
 | ![Music paused screen shown before shutdown](docs/screenshots/paused.png) | ![Animated equalizer using illustrative spectrum data](docs/screenshots/equalizer-animated.gif) |
 
-Playback order is cover, available artist images, track information, then
+Playback order is enabled cover, available enabled artist images, track information, then
 equalizer, then an available video. Artist images, the equalizer, and video are
 optional; the gallery above illustrates the non-video pages. Long text scrolls;
 the information preview captures the start of a scrolling row. The pause screen
@@ -80,7 +80,7 @@ and volume updates do not.
 The display alternates between two pages: a full-screen 64x64 album cover and
 a track-information page with a large countdown, song title, artist, and album.
 Each page stays visible for eight seconds by default; change `page_interval`
-to adjust that duration. New songs start on the cover page. Long text scrolls
+to adjust that duration. New songs start on the first enabled page. Long text scrolls
 horizontally and continues across later information pages.
 
 Enable `show_artist_images` to add up to three full-screen artist photos between
@@ -89,6 +89,15 @@ the cover and track information. Set `music_assistant_url` and
 Photos load in the background and are cached per artist. Missing or ambiguous
 library artists and failed images are skipped; duplicate photos are not repeated.
 See the [artist photo setup guide](hub75/DOCS.md#artist-photos).
+
+Use `show_album_cover`, `show_artist_image_1`, `show_artist_image_2`,
+`show_artist_image_3`, `show_track_info`, `show_equalizer`, and `show_video`
+in the HA app configuration to choose individual screens. Artist-photo
+switches also require `show_artist_images` and respect `artist_image_count`.
+Disabling the cover skips its downloads and lets other pages work without
+album artwork. All playback screens disabled turns WLED off immediately;
+enabled but temporarily unavailable pages also leave it off until available.
+See [choosing screens](hub75/DOCS.md#choosing-screens).
 
 Enable `show_equalizer` to add a page with 16 live spectrum bars. Set
 `audio_sync_port` to the Music Assistant WLED Audio Sync zone's port (default

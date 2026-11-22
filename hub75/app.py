@@ -162,15 +162,19 @@ def render_equalizer(spectrum):
 
 
 def render_frame(cover, player, scroll_seconds=0, now=None, page_interval=8,
-                 equalizer=None, show_track_info=True, artist_images=(), video=None):
+                 equalizer=None, show_track_info=True, artist_images=(), video=None,
+                 show_album_cover=True):
     elapsed = max(0, scroll_seconds)
     artist_images = artist_images[:3]
-    page_count = 1 + len(artist_images) + bool(show_track_info) + (equalizer is not None) + (video is not None)
+    cover_count = int(show_album_cover and cover is not None)
+    page_count = cover_count + len(artist_images) + bool(show_track_info) + (equalizer is not None) + (video is not None)
+    if not page_count:
+        return None
     page_index = int(elapsed // page_interval) % page_count
-    if page_index == 0:
+    if cover_count and page_index == 0:
         return cover.copy()
-    if page_index <= len(artist_images):
-        return artist_images[page_index - 1].copy()
+    if cover_count <= page_index < cover_count + len(artist_images):
+        return artist_images[page_index - cover_count].copy()
     if video is not None and page_index == page_count - 1:
         return video.copy()
     if equalizer is not None and page_index == page_count - 1 - (video is not None):
@@ -549,6 +553,7 @@ class ArtworkBridge:
         self.last_artwork = None
         self.last_health_check = 0
         self.owns_display = False
+        self.display_off = False
         self.current_player = None
         self.playback_active = False
         self.pause_until = None
@@ -571,6 +576,18 @@ class ArtworkBridge:
         self.artist_images = ()
         self.artist_cache = OrderedDict()
         self.artist_task = None
+
+    def artist_pages_enabled(self):
+        return self.artist_enabled and any(
+            self.options.get(f"show_artist_image_{index}", True)
+            for index in range(1, self.artist_image_count + 1)
+        )
+
+    def playback_pages_enabled(self):
+        return (self.options.get("show_album_cover", True)
+                or self.options.get("show_track_info", True)
+                or self.artist_pages_enabled()
+                or self.audio_sync is not None or self.video is not None)
 
     async def get_json(self, url, headers=None):
         async with self.session.get(url, headers=headers) as response:
@@ -669,7 +686,7 @@ class ArtworkBridge:
                 self.artist_task = None
             self.artist_key = key
             self.artist_images = ()
-        if not (self.artist_enabled and self.ma_url and self.ma_token and key):
+        if not (self.artist_pages_enabled() and self.ma_url and self.ma_token and key):
             return
         cached = self.artist_cache.get(key)
         if cached is not None and cached[0] > time.monotonic():
@@ -679,27 +696,32 @@ class ArtworkBridge:
             self.artist_task = asyncio.create_task(self.load_artist_images(name, key))
 
     async def display_artwork(self, picture, player=None):
-        if picture != self.cover_url:
+        if self.options.get("show_album_cover", True) and picture and picture != self.cover_url:
             image_bytes = await self.fetch_artwork(picture)
             self.cover = await asyncio.to_thread(load_cover, image_bytes)
             self.cover_url = picture
-        frame = self.cover
         if player is not None:
             await self.update_artist_images(player)
         video_frame = self.video.current_frame() if self.video is not None else None
         if self.video_visible != (video_frame is not None):
             self.video_visible = video_frame is not None
             self.scroll_started = time.monotonic()
-        if player is not None and (self.options.get("show_track_info", True)
-                                   or self.audio_sync is not None or self.artist_images or video_frame is not None):
-            frame = await asyncio.to_thread(
-                render_frame, self.cover, player, time.monotonic() - self.scroll_started,
-                page_interval=self.options.get("page_interval", 8),
-                equalizer=self.audio_sync.spectrum() if self.audio_sync is not None else None,
-                show_track_info=self.options.get("show_track_info", True),
-                artist_images=self.artist_images,
-                video=video_frame,
-            )
+        artist_images = tuple(
+            image for index, image in enumerate(self.artist_images[:self.artist_image_count], 1)
+            if self.artist_enabled and self.options.get(f"show_artist_image_{index}", True)
+        )
+        frame = await asyncio.to_thread(
+            render_frame, self.cover, player, time.monotonic() - self.scroll_started,
+            page_interval=self.options.get("page_interval", 8),
+            equalizer=self.audio_sync.spectrum() if self.audio_sync is not None else None,
+            show_track_info=self.options.get("show_track_info", True) and player is not None,
+            artist_images=artist_images,
+            video=video_frame,
+            show_album_cover=self.options.get("show_album_cover", True),
+        )
+        if frame is None:
+            await self.disable_display()
+            return
         missing_frame = (self.last_ddp_frame is None if self.output_protocol == "ddp"
                          else self.last_chunks is None)
         full_update = missing_frame or picture != self.last_artwork
@@ -780,6 +802,17 @@ class ArtworkBridge:
             payload.update(live=False, tt=0)
         await self.post_state(payload)
         self.ddp_active = False
+        self.display_off = True
+
+    async def disable_display(self):
+        if not self.display_off:
+            await self.turn_off_display()
+            LOGGER.info("No playback pages enabled or available; turned off WLED")
+        self.owns_display = False
+        self.pause_until = None
+        self.last_chunks = None
+        self.last_ddp_frame = None
+        self.last_artwork = None
 
     async def close(self):
         if self.ha_poll_task is not None:
@@ -833,6 +866,7 @@ class ArtworkBridge:
                         await self.post_state(chunk)
         self.last_chunks = chunks
         self.owns_display = True
+        self.display_off = False
         if full_update:
             self.last_health_check = time.monotonic()
 
@@ -847,10 +881,16 @@ class ArtworkBridge:
         return state.get("on") and segment.get("on") and segment.get("frz")
 
     async def update(self, poll=True, states=None):
+        if not self.playback_pages_enabled():
+            await self.disable_display()
+            return
         if poll or states is not None:
             if states is None:
                 states = await self.get_json(self.ha_url + "/states", self.ha_headers)
-            self.current_player = select_player(states, self.options.get("player_entities", []))
+            self.current_player = select_player(
+                states, self.options.get("player_entities", []),
+                require_picture=self.options.get("show_album_cover", True),
+            )
             active_player = select_player(
                 states, self.options.get("player_entities", []), require_picture=False
             )
@@ -895,7 +935,7 @@ class ArtworkBridge:
                     await self.keep_ddp_alive()
                 self.last_chunks = None
             return
-        picture = player["attributes"]["entity_picture"]
+        picture = player["attributes"].get("entity_picture")
         attributes = player["attributes"]
         track_key = (player["entity_id"], picture, attributes.get("media_content_id"),
                      attributes.get("media_title"), attributes.get("media_artist"),
@@ -905,15 +945,16 @@ class ArtworkBridge:
             self.track_key = track_key
             if self.audio_sync is not None:
                 self.audio_sync.clear()
-        if picture == self.last_artwork:
+        if self.owns_display and picture == self.last_artwork:
             healthy = True
             if time.monotonic() - self.last_health_check >= 30:
                 healthy = await self.display_is_healthy()
                 if not healthy:
                     self.last_chunks = None
                     self.last_ddp_frame = None
-            cover_only = (not self.options.get("show_track_info", True)
-                          and self.audio_sync is None and not self.artist_enabled and self.video is None)
+            cover_only = (self.options.get("show_album_cover", True)
+                          and not self.options.get("show_track_info", True)
+                          and self.audio_sync is None and not self.artist_pages_enabled() and self.video is None)
             if healthy and cover_only:
                 if self.output_protocol == "http" or self.last_ddp_frame is not None:
                     await self.keep_ddp_alive()
@@ -931,13 +972,13 @@ class ArtworkBridge:
                 return 0.05
             return (0.1 if self.current_player is not None
                     and self.options.get("show_track_info", True) else 0.5)
-        if self.artist_enabled or self.options.get("show_track_info", True) or self.audio_sync is not None or self.pause_until is not None:
+        if self.artist_pages_enabled() or self.options.get("show_track_info", True) or self.audio_sync is not None or self.pause_until is not None:
             return 1
         return self.options.get("refresh_interval", 5)
 
     async def run(self):
         try:
-            if self.artist_enabled and not (self.ma_url and self.ma_token):
+            if self.artist_pages_enabled() and not (self.ma_url and self.ma_token):
                 LOGGER.warning("Artist pages need music_assistant_url and music_assistant_token; skipping photos")
             if self.audio_sync is not None:
                 await self.audio_sync.start()

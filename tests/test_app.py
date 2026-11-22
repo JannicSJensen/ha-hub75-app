@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import unittest
 from datetime import datetime, timezone
+from itertools import product
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -45,6 +46,10 @@ class ManifestTests(unittest.TestCase):
         self.assertTrue(config["host_network"])
         self.assertTrue(config["init"])
         self.assertTrue(config["options"]["show_track_info"])
+        for option in ("show_album_cover", "show_artist_image_1",
+                       "show_artist_image_2", "show_artist_image_3"):
+            self.assertTrue(config["options"][option])
+            self.assertEqual(config["schema"][option], "bool")
         self.assertTrue(config["options"]["pause_then_off"])
         self.assertEqual(config["options"]["page_interval"], 8)
         self.assertEqual(config["options"]["rotation"], "0")
@@ -456,6 +461,42 @@ class RotationTests(unittest.TestCase):
 
 
 class ArtistPageTests(unittest.TestCase):
+    def test_every_playback_page_combination_skips_disabled_pages(self):
+        cover = Image.new("RGB", (64, 64), "red")
+        photos = [Image.new("RGB", (64, 64), color) for color in ("blue", "green", "yellow")]
+        video = Image.new("RGB", (64, 64), "purple")
+        spectrum = [128] * 16
+        selected = player()
+        now = datetime(2026, 11, 8, tzinfo=timezone.utc)
+        info = APP.render_frame(None, selected, now=now, show_album_cover=False)
+        for switches in product((False, True), repeat=7):
+            with self.subTest(switches=switches):
+                show_cover, first, second, third, show_info, show_eq, show_video = switches
+                enabled_photos = tuple(photo for photo, enabled in zip(
+                    photos, (first, second, third)) if enabled)
+                expected = ([cover] if show_cover else []) + list(enabled_photos)
+                expected += [info] if show_info else []
+                expected += [APP.render_equalizer(spectrum)] if show_eq else []
+                expected += [video] if show_video else []
+                options = dict(show_album_cover=show_cover, artist_images=enabled_photos,
+                               show_track_info=show_info, equalizer=spectrum if show_eq else None,
+                               video=video if show_video else None, now=now)
+                if not expected:
+                    self.assertIsNone(APP.render_frame(cover, selected, **options))
+                    continue
+                for index, frame in enumerate([*expected, *expected]):
+                    actual = APP.render_frame(cover, selected, index * 8, **options)
+                    self.assertEqual(actual.tobytes(), frame.tobytes())
+
+    def test_information_only_scrolls_continuously_without_cover(self):
+        selected = player()
+        selected["attributes"]["media_title"] = "A very long song title beyond the panel"
+        first = APP.render_frame(None, selected, 0, show_album_cover=False)
+        later = APP.render_frame(None, selected, 8, show_album_cover=False)
+        expected = APP.render_frame(Image.new("RGB", (64, 64)), selected, 24)
+        self.assertEqual(later.tobytes(), expected.tobytes())
+        self.assertNotEqual(first.tobytes(), later.tobytes())
+
     def test_cover_artist_photos_information_equalizer_rotation_order(self):
         cover = Image.new("RGB", (64, 64), "red")
         photos = [Image.new("RGB", (64, 64), color) for color in ("blue", "green", "yellow")]
@@ -686,6 +727,157 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.ma_detail["metadata"]["images"] = [
             {"type": "thumb", "path": self.base + "/artist-photo", "remotely_accessible": True},
         ]
+
+    async def test_individual_artist_switches_and_count_filter_pages(self):
+        self.enable_artists()
+        self.bridge.options.update(show_album_cover=False, show_track_info=False)
+        photos = tuple(Image.new("RGB", (64, 64), color) for color in ("red", "green", "blue"))
+        self.bridge.artist_cache["artist"] = (APP.time.monotonic() + 3600, photos)
+        for switches in product((False, True), repeat=3):
+            for count in (1, 2, 3):
+                with self.subTest(switches=switches, count=count):
+                    self.bridge.artist_image_count = count
+                    self.bridge.options.update({
+                        f"show_artist_image_{index}": enabled
+                        for index, enabled in enumerate(switches, 1)
+                    })
+                    expected = [photo for photo, enabled in zip(photos[:count], switches)
+                                if enabled]
+                    await self.bridge.update()
+                    if not expected:
+                        self.assertTrue(self.bridge.display_off)
+                        self.assertFalse(self.bridge.owns_display)
+                        continue
+                    for index, photo in enumerate([*expected, expected[0]]):
+                        self.bridge.scroll_started = APP.time.monotonic() - index * 8
+                        await self.bridge.update(poll=False)
+                        self.assertEqual(self.bridge.last_chunks, APP.pixel_chunks(photo))
+        self.assertEqual(self.auth, [])
+        self.assertEqual(self.ma_calls, [])
+
+    async def test_disabled_artist_slots_do_not_start_lookup(self):
+        self.enable_artists()
+        self.bridge.options.update(show_artist_image_1=False, show_artist_image_2=False,
+                                   show_artist_image_3=False)
+        await self.bridge.update()
+        self.assertIsNone(self.bridge.artist_task)
+        self.assertEqual(self.ma_calls, [])
+        self.assertEqual(self.bridge.last_chunks, APP.pixel_chunks(APP.load_cover(self.art)))
+
+    async def test_cover_upload_without_player_keeps_existing_helper_behavior(self):
+        self.bridge.options["show_track_info"] = True
+        await self.bridge.display_artwork(self.states[0]["attributes"]["entity_picture"])
+        self.assertEqual(self.bridge.last_chunks, APP.pixel_chunks(APP.load_cover(self.art)))
+
+    async def test_all_disabled_turns_off_without_polling_or_pause_and_retries_failure(self):
+        self.bridge.options.update(show_album_cover=False, pause_then_off=True)
+        with patch.object(self.bridge, "get_json", side_effect=RuntimeError("HA unavailable")), \
+                patch.object(self.bridge, "post_state", side_effect=RuntimeError("WLED unavailable")):
+            with self.assertRaisesRegex(RuntimeError, "WLED unavailable"):
+                await self.bridge.update()
+        self.assertFalse(self.bridge.display_off)
+        with patch.object(self.bridge, "get_json", side_effect=RuntimeError("HA unavailable")):
+            await self.bridge.update()
+            await self.bridge.update()
+        self.assertEqual(self.posts, [{"on": False}])
+        self.assertIsNone(self.bridge.pause_until)
+        self.assertFalse(self.bridge.owns_display)
+        self.assertEqual(self.auth, [])
+
+    async def test_all_disabled_ddp_stops_streaming_then_enabled_info_recovers(self):
+        self.enable_ddp()
+        await self.bridge.update()
+        await self.receive_ddp()
+        self.bridge.options.update(show_album_cover=False, pause_then_off=True)
+        await self.bridge.update()
+        self.assertEqual(self.posts[-1], {"on": False, "live": False, "tt": 0})
+        self.assertIsNone(self.bridge.ddp_heartbeat)
+        self.assertIsNone(self.bridge.ddp_socket)
+        self.assertIsNone(self.bridge.last_ddp_frame)
+        self.assertIsNone(self.bridge.pause_until)
+        self.bridge.options["show_track_info"] = True
+        self.states[0]["attributes"].pop("entity_picture")
+        await self.bridge.update()
+        expected = APP.render_frame(None, self.states[0], show_album_cover=False)
+        self.assertEqual(await self.receive_ddp(), expected.tobytes())
+        self.assertTrue(self.bridge.owns_display)
+        self.assertFalse(self.bridge.display_off)
+
+    async def test_info_only_without_artwork_skips_downloads_and_preserves_pause_resume(self):
+        self.bridge.options.update(show_album_cover=False, show_track_info=True,
+                                   pause_then_off=True, rotation="90")
+        self.states[0]["attributes"].pop("entity_picture")
+        await self.bridge.update()
+        expected = APP.rotate_frame(APP.render_frame(None, self.states[0],
+                                                     show_album_cover=False), "90")
+        self.assertEqual(self.bridge.last_chunks, APP.pixel_chunks(expected))
+        self.states[0]["state"] = "paused"
+        await self.bridge.update()
+        self.assertIsNotNone(self.bridge.pause_until)
+        self.assertEqual(self.bridge.last_chunks,
+                         APP.pixel_chunks(APP.rotate_frame(APP.render_paused_frame(), "90")))
+        self.states[0]["state"] = "playing"
+        await self.bridge.update()
+        self.assertIsNone(self.bridge.pause_until)
+        self.assertEqual(self.bridge.last_chunks, APP.pixel_chunks(expected))
+        self.assertEqual(self.auth, [])
+
+    async def test_unavailable_artist_only_turns_off_then_recovers_on_loaded_photos(self):
+        self.enable_artists()
+        self.bridge.options.update(show_album_cover=False, pause_then_off=True)
+        self.states[0]["attributes"].pop("entity_picture")
+        self.ma_gate = asyncio.Event()
+        try:
+            await self.bridge.update()
+            self.assertEqual(self.posts, [{"on": False}])
+            self.assertIsNotNone(self.bridge.artist_task)
+            await self.bridge.update(poll=False)
+            self.assertEqual(self.posts, [{"on": False}])
+            self.ma_gate.set()
+            await self.bridge.artist_task
+            await self.bridge.update(poll=False)
+            self.assertEqual(self.bridge.last_chunks, APP.pixel_chunks(APP.load_cover(self.artist_art)))
+            self.assertFalse(self.bridge.display_off)
+            self.assertTrue(self.bridge.owns_display)
+            self.assertEqual(self.auth, [])
+        finally:
+            self.ma_gate.set()
+
+    async def test_video_only_stale_frame_turns_off_and_recovers_without_cover(self):
+        self.enable_ddp()
+        self.bridge.video = APP.VideoPage()
+        self.bridge.options.update(show_album_cover=False, pause_then_off=True)
+        self.states[0]["attributes"].update(media_title="Song", media_artist="Artist",
+                                            entity_picture=None)
+        with patch.object(self.bridge.video, "run", AsyncMock()):
+            await self.bridge.update()
+        self.assertTrue(self.bridge.display_off)
+        with patch.object(self.bridge, "display_is_healthy",
+                          side_effect=AssertionError("No frame to health-check")):
+            await self.bridge.update(poll=False)
+        video = Image.new("RGB", (64, 64), "purple")
+        self.bridge.video.frame = video
+        self.bridge.video.frame_time = APP.time.monotonic()
+        await self.bridge.update(poll=False)
+        self.assertEqual(await self.receive_ddp(), video.tobytes())
+        self.bridge.video.frame_time -= 3
+        await self.bridge.update(poll=False)
+        self.assertTrue(self.bridge.display_off)
+        self.assertIsNone(self.bridge.ddp_heartbeat)
+        self.assertIsNone(self.bridge.pause_until)
+        self.bridge.video.frame_time = APP.time.monotonic()
+        await self.bridge.update(poll=False)
+        self.assertEqual(await self.receive_ddp(), video.tobytes())
+        self.assertEqual(self.auth, [])
+
+    async def test_equalizer_only_without_artwork(self):
+        self.enable_ddp()
+        self.bridge.audio_sync = APP.AudioSyncReceiver()
+        self.bridge.options["show_album_cover"] = False
+        self.states[0]["attributes"].pop("entity_picture")
+        await self.bridge.update()
+        self.assertEqual(await self.receive_ddp(), APP.render_equalizer([0] * 16).tobytes())
+        self.assertEqual(self.auth, [])
 
     async def test_artist_photos_load_in_background_and_cache_without_cover_download(self):
         self.enable_artists()

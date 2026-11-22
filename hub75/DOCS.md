@@ -18,8 +18,12 @@ output_protocol: http
 player_entities: []
 idle_action: keep
 pause_then_off: true
+show_album_cover: true
 show_track_info: true
 show_artist_images: false
+show_artist_image_1: true
+show_artist_image_2: true
+show_artist_image_3: true
 artist_image_count: 3
 music_assistant_url: ""
 music_assistant_token: ""
@@ -43,8 +47,12 @@ log_level: info
 | `player_entities` | Optional list of Music Assistant HA media-player IDs. Empty means all MA players. |
 | `idle_action` | Used only when `pause_then_off` is `false`: `keep` leaves the last frame visible; `off` turns WLED off immediately. |
 | `pause_then_off` | Show "music paused" for 60 seconds after playback stops, then switch WLED off. Default: `true`. Overrides `idle_action`. |
+| `show_album_cover` | Include the album-cover page. Default: `true`. Disable for information-, artist-, equalizer-, or video-only playback without requiring or downloading album artwork. |
 | `show_track_info` | Include the track-information page. Default: `true`. Disable all optional pages for an uninterrupted cover. |
 | `show_artist_images` | Include up to three full-screen artist photos after the cover. Default: `false`. Requires MA URL/token settings. |
+| `show_artist_image_1` | Include the first available distinct artist photo when `show_artist_images` is enabled. Default: `true`. |
+| `show_artist_image_2` | Include the second available distinct artist photo when `show_artist_images` is enabled and `artist_image_count` is at least 2. Default: `true`. |
+| `show_artist_image_3` | Include the third available distinct artist photo when `show_artist_images` is enabled and `artist_image_count` is 3. Default: `true`. |
 | `artist_image_count` | Maximum number of distinct artist photos, from 1 to 3. Default: `3`. Missing photos are skipped, not repeated. |
 | `music_assistant_url` | Optional MA server base URL, for example `http://YOUR_MA_HOST:8095`. Use the direct server URL, not HA ingress or `/api`. |
 | `music_assistant_token` | Optional MA access token for artist-library reads, entered in the password field. Not a HA or Supervisor token. |
@@ -55,13 +63,39 @@ log_level: info
 | `video_fps` | Decoded video frames per second, from 5 to 20. Default: `10`. Lower this on slower HA hosts. |
 | `video_fit` | `contain` (default) preserves the full picture with black padding; `cover` fills the panel and crops the edges. |
 | `video_offset` | Video timing offset in seconds, -60 to 60. Default: `0`. Positive advances video; negative delays it, clamped at the beginning. |
-| `page_interval` | Seconds each available page remains visible, from 3 to 60. Default: 8. Only the cover is shown when no optional pages are available. |
+| `page_interval` | Seconds each enabled, available page remains visible, from 3 to 60. Default: 8. A single enabled page stays visible without flipping. |
 | `rotation` | Dropdown for clockwise rotation: `0`, `45`, `90`, `135`, or `180` degrees. Default: `0`. Applies to every page. |
 | `refresh_interval` | Seconds between HA checks, from 1 to 60. Default: 5. |
 | `log_level` | `debug`, `info`, `warning`, or `error`. Default: `info`. |
 
 Save options and restart the app to apply changes. Home Assistant Core does not
 need a restart. The app uses its automatically supplied Supervisor token.
+
+## Choosing Screens
+
+Each playback screen can be enabled or disabled independently in the app's
+Configuration tab: album cover, artist photos 1/2/3, track information,
+equalizer, and video. The existing `show_artist_images` switch enables the
+artist-photo group; the three individual switches then select photos within
+the `artist_image_count` limit. Turn off the group or all three photo switches
+to disable every artist page and its lookup.
+
+Rotation includes only enabled, available screens in the existing order:
+cover, artist photos 1/2/3, track information, equalizer, video. New tracks and
+newly available images/video start at the first included screen. Disable
+`show_album_cover` to omit the cover entirely, including its network download;
+other pages then work even if the player has no `entity_picture`.
+
+If all playback screens are disabled, the app immediately turns WLED off,
+even when starting idle. It does not show the pause screen or fetch HA states
+in this mode. If enabled screens are temporarily unavailable (for example,
+artist-only or video-only playback while loading), WLED is also turned off
+instead of showing a disabled cover. It turns back on when a page becomes
+available. Failed power-off requests are retried.
+
+The separate `pause_then_off` option controls the pause screen/shutdown behavior
+when playback screens are enabled. Save settings and restart the app to apply
+changes. Existing installations retain the same screen selection by default.
 
 ## Choosing Players
 
@@ -76,8 +110,9 @@ player_entities:
 ```
 
 With multiple players, the one whose state most recently changed to `playing`
-wins. Players without artwork are skipped for cover selection, but still count
-as playing so a temporary missing cover does not trigger a pause screen. The
+wins. With `show_album_cover: true`, players without artwork are skipped for
+cover selection, but still count as playing so a temporary missing cover does
+not trigger a pause screen. The
 app does not start, pause, or change music playback.
 
 ## Pause and Shutdown
@@ -89,8 +124,8 @@ WLED `on: false`. Repeated idle updates do not restart the timer or wake the
 display after shutdown. This behavior also works with `show_track_info: false`.
 
 Resuming any selected player cancels the timer and restores the playing display
-starting with the cover page. Resuming after shutdown turns WLED back on. If
-another selected player is still playing, its cover takes over instead of
+starting with the first enabled, available page. Resuming after shutdown turns WLED back on. If
+another selected player is still playing, its enabled pages take over instead of
 showing the pause message. Playback changes are detected on the next HA poll.
 
 Starting the app while music is already idle does not take over or turn off an
@@ -112,6 +147,9 @@ Only enabled and available pages are included. Set `artist_image_count: 2` for
 at most two photo pages, or `3` for at most three. If only one distinct photo is
 available, it appears once. Each page uses `page_interval` and the configured
 rotation. Photos preserve their aspect ratio with black padding like the cover.
+Use `show_artist_image_1`, `show_artist_image_2`, and `show_artist_image_3`
+to skip individual available photo slots. Disabling photo 1 does not rename
+photo 2 or bypass the count limit.
 
 Create an access token in Music Assistant's Profile settings and enter it
 directly in this app's `music_assistant_token` password field. Give the token
@@ -134,7 +172,7 @@ photos. Images are constrained by the same size limits as album covers. Up to
 lookups for five minutes. Tracks by the same artist reuse those photos. Restarting
 clears the cache. Changing artists clears the previous photo pages and cancels
 an old lookup; pausing and stopping retain the existing pause-then-off behavior.
-When a new set of photos arrives, the page cycle restarts on the cover.
+When a new set of photos arrives, the page cycle restarts on the first enabled page.
 
 The MA token is used only for MA API and MA-proxied image requests. Public image
 hosts receive no MA token, and neither MA nor external hosts receive the
@@ -151,7 +189,9 @@ do not fit scroll horizontally, starting after a two-second reading pause on
 the first information page. Scrolling continues across later information pages
 so long titles can be read in full. Each row is clipped to its own area.
 
-New songs and player changes start the cycle on the cover page. The countdown
+New songs and player changes start the cycle on the first enabled page. Disable
+`show_album_cover` and the other pages for uninterrupted track information.
+The countdown
 uses the current playback position when the information page reappears, rather
 than resuming an old timer value from before the cover page.
 
@@ -165,7 +205,7 @@ these pages by default. With `pause_then_off: false` and `idle_action: keep`, th
 last rendered frame stays visible, including its last countdown value.
 
 Updating from 0.2.0 replaces the compact layout with these two pages. Set
-`show_artist_images: false`, `show_track_info: false`, `show_equalizer: false`, and
+`show_album_cover: true`, `show_artist_images: false`, `show_track_info: false`, `show_equalizer: false`, and
 `show_video: false`, then restart the app
 for an uninterrupted 64x64 cover.
 The HA polling
@@ -196,9 +236,10 @@ With artist photos disabled and both other optional pages enabled, the cycle is
 **cover > track information > equalizer > cover**, with `page_interval` applying
 to each page. Artist photos, when enabled and available, come after the cover. Disabling
 `show_track_info` gives **cover > equalizer > cover**. Rotation applies to the
-equalizer as well. Silence shows empty bars, not simulated audio. While the
+equalizer as well. Also disable `show_album_cover` for an uninterrupted equalizer.
+Silence shows empty bars, not simulated audio. While the
 equalizer page is rendering, missing or invalid packets clear the bars after
-two seconds. New songs clear old spectrum data and restart on the cover page.
+two seconds. New songs clear old spectrum data and restart on the first enabled page.
 The default pause screen still replaces all playback pages when music stops.
 
 The app joins multicast **239.0.0.1** on `audio_sync_port`. Host networking is
@@ -246,7 +287,8 @@ Available pages rotate through **cover > artist photos > track information >
 equalizer > video > cover**, omitting disabled or missing pages. `page_interval`
 applies to video too. Decoding continues while other pages are visible, so the
 video resumes at the current song position rather than restarting on each flip.
-When video becomes available or disappears, the cycle restarts at the cover.
+When video becomes available or disappears, the cycle restarts at the first
+enabled, available page. Disable every other playback page for video-only mode.
 Shared clockwise rotation applies to every decoded frame.
 
 The app uses HA's artist/title to search up to five YouTube results and tries up
@@ -370,22 +412,26 @@ Home Assistant. A brightness of zero, or a segment brightness of zero, produces
 a dark image. HUB75 panels need a properly sized independent 5V supply; WLED's
 automatic current limiter does not account for HUB75 power consumption.
 
-The app turns the display on when uploading a cover. While music is playing,
+The app turns the display on when uploading an enabled page. While music is playing,
 turning it off or selecting another effect may be undone by the next health
 check within 30 seconds. Stop the app to control WLED independently. In HTTP
 mode stopping leaves the frozen image as it is. In DDP mode stopping releases
 realtime mode and WLED returns to its underlying effect; the streamed image is
 not persisted. `idle_action` applies to playback, not to app shutdown. Pixel
 images are not persistent across controller restarts, but
-the app restores the cover if music is still playing.
+the app restores the enabled pages if music is still playing.
 
 ## Troubleshooting
 
-- **No cover:** verify the MA integration exposes artwork and the correct player
+- **No cover:** enable `show_album_cover`, verify the MA integration exposes artwork and the correct player
   is `playing`. Check `player_entities`; an empty list follows all MA players.
 - **No artist photos:** enable `show_artist_images`, configure the MA URL/token,
+  enable the desired `show_artist_image_1/2/3` slots within `artist_image_count`,
   and check that the artist name matches one MA library artist with usable images.
   Failed lookups are cached for five minutes; restart after correcting settings.
+- **Display turns off during playback:** enable at least one playback screen.
+  Artist-only and video-only setups stay off while their enabled pages are
+  loading or unavailable; enable the cover or information page for a fallback.
 - **HTTP 401/403:** stop and start the app to obtain its Supervisor token. No
   long-lived user token should be configured.
 - **HTTP 404:** the HA media proxy may be temporarily unavailable during a track

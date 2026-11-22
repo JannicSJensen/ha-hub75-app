@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.0
+
+- Add `show_album_cover` and individual `show_artist_image_1`, `show_artist_image_2`, and `show_artist_image_3` switches in the HA app configuration.
+- Keep existing defaults and the `show_artist_images` group switch and `artist_image_count` limit.
+- Rotate only enabled, available pages, starting with the first enabled page instead of forcing the cover.
+- Allow information, artist-photo, equalizer, and video playback without album artwork when the cover is disabled; skip cover downloads.
+- Turn WLED off when all playback screens are disabled or no enabled page is currently available, and resume when an enabled page becomes available.
+- Preserve pause-then-off behavior whenever playback pages are enabled.
+
 ## 0.9.0
 
 - Add an optional YouTube video page after cover, artist photos, track information, and equalizer.
