@@ -1,3 +1,19 @@
+# Moved to Home Assistant Apps
+
+HUB75 Album Artwork is now maintained in the public
+[JannicSJensen/ha-apps](https://github.com/JannicSJensen/ha-apps) repository.
+Add that repository URL to Home Assistant for new installations and future updates.
+
+**Existing installations do not migrate automatically.** Back up the old app,
+install its new copy, transfer Configuration options, stop the old copy, and
+verify the new copy before uninstalling anything. Do not run both against the
+same display. Follow the
+[migration guide](https://github.com/JannicSJensen/ha-apps/blob/main/MIGRATION.md).
+This original repository is archived; running apps are not stopped or deleted,
+but will receive no further updates here.
+
+## Historical documentation
+
 # HUB75 Album Artwork
 
 A standalone Home Assistant app that displays Music Assistant album artwork,
